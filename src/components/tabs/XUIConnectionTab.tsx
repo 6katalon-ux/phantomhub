@@ -148,7 +148,6 @@ export const XUIConnectionTab: React.FC<XUIConnectionTabProps> = ({
                 onChange={e => setFormData({ ...formData, xui_username: e.target.value })}
                 placeholder="admin"
                 className="w-full px-3.5 py-2.5 bg-neutral-950 border border-neutral-800 rounded-xl text-xs text-neutral-200 focus:outline-none focus:border-cyan-500/60 transition-colors"
-                required
               />
             </div>
 
@@ -164,6 +163,30 @@ export const XUIConnectionTab: React.FC<XUIConnectionTabProps> = ({
                 className="w-full px-3.5 py-2.5 bg-neutral-950 border border-neutral-800 rounded-xl text-xs font-mono text-neutral-200 focus:outline-none focus:border-cyan-500/60 transition-colors"
               />
             </div>
+          </div>
+
+          {/* API Token (Optional / Recommended) */}
+          <div className="p-3.5 bg-neutral-950/80 border border-cyan-900/40 rounded-xl space-y-2">
+            <div className="flex items-center justify-between">
+              <label className="block text-xs font-semibold text-cyan-300">
+                {isRtl ? '🔑 توکن اختصاصی API پنل سنایی (API Token - پیشنهادی):' : '🔑 3X-UI API Token (Recommended):'}
+              </label>
+              <span className="text-[10px] text-emerald-400 bg-emerald-950/60 border border-emerald-800/40 px-2 py-0.5 rounded-full font-mono">
+                {isRtl ? 'بدون نیاز به نام‌کاربری/رمز' : 'Bypasses 403 & 2FA'}
+              </span>
+            </div>
+            <input
+              type="text"
+              value={formData.xui_token || ''}
+              onChange={e => setFormData({ ...formData, xui_token: e.target.value })}
+              placeholder="e.g. 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d یا توکن کپی‌شده از پنل سنایی"
+              className="w-full px-3.5 py-2.5 bg-neutral-900 border border-neutral-800 rounded-xl text-xs font-mono text-neutral-200 focus:outline-none focus:border-cyan-500/60 transition-colors placeholder:text-neutral-600"
+            />
+            <p className="text-[11px] text-neutral-400 leading-relaxed">
+              {isRtl
+                ? '💡 در پنل سنایی، به بخش Panel Settings رفته و مقدار API Token را کپی و اینجا قرار دهید. با وارد کردن این توکن، سیستم مستقیماً بدون نیاز به رمز و بدون خطای ۴۰۳ متصل می‌شود.'
+                : 'In 3X-UI Settings -> Panel Settings, copy your API Token. With this token, connection succeeds directly without needing passwords or 2FA.'}
+            </p>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">

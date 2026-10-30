@@ -161,11 +161,65 @@ class XUIClient:
 
         return False, last_error or "عدم امکان برقراری ارتباط با پنل 3X-UI. آدرس و پورت را بررسی کنید."
 
+    async def _test_direct_token(self, token: str) -> Tuple[bool, str, List[Any], str]:
+        """Try authenticating with API Token directly on panel/api/inbounds/list without login"""
+        candidates = self._get_candidate_urls()
+        session = await self._ensure_session()
+        last_err = ""
+        for base_url in candidates:
+            parsed = urllib.parse.urlsplit(base_url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Origin": origin,
+                "Referer": f"{base_url}/",
+                "Authorization": f"Bearer {token}",
+                "token": token,
+                "X-Token": token
+            }
+            endpoints = [
+                f"{base_url}/panel/api/inbounds/list",
+                f"{base_url}/xui/API/inbounds/"
+            ]
+            if parsed.path and parsed.path != "/":
+                endpoints.append(f"{origin}/panel/api/inbounds/list")
+
+            for ep in endpoints:
+                for param_payload in [{"token": token}, {}]:
+                    try:
+                        async with session.get(ep, headers=headers, params=param_payload) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                if data.get("success", False):
+                                    inbounds = data.get("obj", []) or []
+                                    self._active_base_url = base_url
+                                    return True, "اتصال با توکن API با موفقیت برقرار شد", inbounds, base_url
+                    except Exception as e:
+                        last_err = str(e)
+        return False, last_err, [], ""
+
     async def test_connection(self) -> Dict[str, Any]:
         """Comprehensive check for admin dashboard test button"""
         base_url = self._get_base_url()
+        token = str(config.get("xui_token", "")).strip()
         import time
         t0 = time.time()
+
+        # 1. If API Token is provided, try direct token authentication first!
+        if token:
+            ok_token, token_msg, inbounds, active_url = await self._test_direct_token(token)
+            if ok_token:
+                duration_ms = int((time.time() - t0) * 1000)
+                return {
+                    "success": True,
+                    "message": f"اتصال با موفقیت از طریق توکن API (بدون نیاز به رمز عبور) برقرار گردید ({len(inbounds)} اینباند شناسایی شد)",
+                    "latency_ms": duration_ms,
+                    "inbounds_count": len(inbounds),
+                    "base_url": active_url or base_url
+                }
+
+        # 2. Otherwise perform standard session login
         ok, msg = await self.login()
         duration_ms = int((time.time() - t0) * 1000)
         
@@ -245,9 +299,11 @@ class XUIClient:
             "Origin": origin,
             "Referer": f"{base_url}/"
         }
-        token = config.get("xui_token", "")
+        token = str(config.get("xui_token", "")).strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
+            headers["token"] = token
+            headers["X-Token"] = token
         return headers
 
     async def get_inbound(self, inbound_id: int) -> Optional[Dict[str, Any]]:
