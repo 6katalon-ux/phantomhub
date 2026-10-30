@@ -196,10 +196,12 @@ class ApiService {
     }
   }
 
-  async testXUIConnection(): Promise<{ success: boolean; message: string; latency_ms: number; inbounds_count: number }> {
+  async testXUIConnection(payload?: any): Promise<{ success: boolean; message: string; latency_ms: number; inbounds_count: number }> {
     try {
       const res = await this.request<any>('/api/settings/test-xui', {
-        method: 'POST'
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload ? JSON.stringify(payload) : undefined
       });
       return {
         success: Boolean(res.success),

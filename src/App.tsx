@@ -384,7 +384,7 @@ export default function App() {
             <XUIConnectionTab
               settings={settings}
               onSave={handleSaveSettings}
-              onTestConnection={() => api.testXUIConnection()}
+              onTestConnection={(data) => api.testXUIConnection(data)}
               isRtl={isRtl}
             />
           )}

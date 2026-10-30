@@ -17,24 +17,48 @@ class XUIClient:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._cookie_jar: Optional[aiohttp.CookieJar] = None
+        self._active_base_url: Optional[str] = None
 
-    def _get_base_url(self) -> str:
-        url = str(config.get("xui_url", "http://127.0.0.1:2053")).strip().rstrip("/")
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = f"http://{url}"
+    def _clean_url(self, raw_url: str) -> str:
+        url = str(raw_url).strip().lstrip(".").rstrip("/")
         return url
 
+    def _get_candidate_urls(self) -> List[str]:
+        raw = self._clean_url(config.get("xui_url", "http://127.0.0.1:2053"))
+        candidates: List[str] = []
+        if raw.startswith("http://") or raw.startswith("https://"):
+            candidates.append(raw)
+            if raw.startswith("http://"):
+                candidates.append("https://" + raw[7:])
+            elif raw.startswith("https://"):
+                candidates.append("http://" + raw[8:])
+        else:
+            # If domain or port 2053, try https first then http
+            candidates.append(f"https://{raw}")
+            candidates.append(f"http://{raw}")
+        return candidates
+
+    def _get_base_url(self) -> str:
+        if self._active_base_url:
+            return self._active_base_url
+        candidates = self._get_candidate_urls()
+        return candidates[0] if candidates else "http://127.0.0.1:2053"
+
     def _get_timeout(self) -> aiohttp.ClientTimeout:
-        timeout_sec = config.get_int("xui_timeout", 10)
-        return aiohttp.ClientTimeout(total=timeout_sec, connect=5)
+        timeout_sec = config.get_int("xui_timeout", 12)
+        return aiohttp.ClientTimeout(total=timeout_sec, connect=6)
 
     def _get_ssl_verify(self) -> bool:
         return config.get_bool("xui_tls_verify", False)
 
-    async def _ensure_session(self) -> aiohttp.ClientSession:
+    async def _ensure_session(self, reset: bool = False) -> aiohttp.ClientSession:
+        if reset and self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
         if self._session is None or self._session.closed:
-            if self._cookie_jar is None:
-                self._cookie_jar = aiohttp.CookieJar(unsafe=True)
+            self._cookie_jar = aiohttp.CookieJar(unsafe=True)
+            # ssl=False allows self-signed certificates or domain cert mismatches common on 3X-UI VPS
             connector = aiohttp.TCPConnector(ssl=self._get_ssl_verify())
             self._session = aiohttp.ClientSession(
                 cookie_jar=self._cookie_jar,
@@ -49,39 +73,93 @@ class XUIClient:
 
     async def login(self) -> Tuple[bool, str]:
         """Authenticate with 3X-UI panel and capture session cookie"""
-        session = await self._ensure_session()
-        base_url = self._get_base_url()
-        username = config.get("xui_username", "admin")
-        password = config.get("xui_password", "admin")
-        token = config.get("xui_token", "")
+        session = await self._ensure_session(reset=True)
+        username = str(config.get("xui_username", "admin")).strip()
+        password = str(config.get("xui_password", "admin")).strip()
+        token = str(config.get("xui_token", "")).strip()
 
-        # Test both common login endpoints: /login and /xui/API/inbounds (if token)
-        login_url = f"{base_url}/login"
-        payload = {"username": username, "password": password}
-        headers = {
-            "User-Agent": "Mozilla/5.0 (VPN-Store-Backend/1.0)",
-            "Accept": "application/json"
-        }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        candidates = self._get_candidate_urls()
+        last_error = ""
+        had_403 = False
 
-        try:
-            async with session.post(login_url, data=payload, headers=headers) as resp:
-                text = await resp.text()
+        for base_url in candidates:
+            parsed = urllib.parse.urlsplit(base_url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Origin": origin,
+                "Referer": f"{base_url}/"
+            }
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+            login_urls = [f"{base_url}/login"]
+            if parsed.path and parsed.path != "/":
+                # If a subpath was entered e.g. /iMKbdWvTPsp4qgcsyZ, also try root /login if subpath fails
+                login_urls.append(f"{origin}/login")
+
+            payload = {"username": username, "password": password}
+
+            for login_url in login_urls:
+                # 1. Try form-encoded data
                 try:
-                    data = json.loads(text)
-                    if data.get("success") or resp.status == 200:
-                        return True, "Login successful"
-                    return False, data.get("msg", f"HTTP {resp.status}: {text[:150]}")
+                    async with session.post(login_url, data=payload, headers=headers) as resp:
+                        text = await resp.text()
+                        if resp.status == 403:
+                            had_403 = True
+                            last_error = f"HTTP 403: {text[:150]}"
+                        elif resp.status == 200:
+                            try:
+                                data = json.loads(text)
+                                if data.get("success", False):
+                                    self._active_base_url = base_url
+                                    return True, "Login successful"
+                                elif "msg" in data:
+                                    last_error = data.get("msg")
+                            except Exception:
+                                # 200 OK without JSON error -> session cookie established
+                                self._active_base_url = base_url
+                                return True, "Login session initialized"
+                except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError) as conn_err:
+                    last_error = f"Connection failed to {login_url}: {conn_err}"
+                    continue
+                except Exception as e:
+                    last_error = str(e)
+                    continue
+
+                # 2. Try JSON payload as fallback (some 3X-UI versions expect application/json)
+                try:
+                    json_headers = dict(headers)
+                    json_headers["Content-Type"] = "application/json"
+                    async with session.post(login_url, json=payload, headers=json_headers) as resp:
+                        text = await resp.text()
+                        if resp.status == 403:
+                            had_403 = True
+                            last_error = f"HTTP 403: {text[:150]}"
+                        elif resp.status == 200:
+                            try:
+                                data = json.loads(text)
+                                if data.get("success", False):
+                                    self._active_base_url = base_url
+                                    return True, "Login successful"
+                            except Exception:
+                                self._active_base_url = base_url
+                                return True, "Login session initialized"
                 except Exception:
-                    # In some panels, 200 OK with session cookie is returned
-                    if resp.status == 200:
-                        return True, "Login session initialized"
-                    return False, f"Unexpected response (HTTP {resp.status}): {text[:150]}"
-        except aiohttp.ClientConnectorError as e:
-            return False, f"Cannot connect to 3X-UI at {base_url}. Verify server is running and port is open: {e}"
-        except Exception as e:
-            return False, f"3X-UI connection failed: {str(e)}"
+                    pass
+
+        if had_403:
+            return False, (
+                "خطا: پاسخ ۴۰۳ (دسترسی غیرمجاز) از 3X-UI دریافت شد. "
+                "این خطا در ۹۹٪ مواقع به دلیل اشتباه بودن «نام کاربری» یا «کلمه عبور» پنل 3X-UI است. "
+                "لطفاً دقت کنید که حروف کوچک و بزرگ کلمه عبور دقیقاً رعایت شده باشد. "
+                "همچنین اگر روی پنل تایید دو مرحله‌ای (2FA) فعال است موقتاً غیرفعال کنید "
+                "و در ابتدای آدرس پنل حتماً پروتکل (https:// یا http://) را دقیق وارد نمایید."
+            )
+
+        return False, last_error or "عدم امکان برقراری ارتباط با پنل 3X-UI. آدرس و پورت را بررسی کنید."
 
     async def test_connection(self) -> Dict[str, Any]:
         """Comprehensive check for admin dashboard test button"""
@@ -105,31 +183,41 @@ class XUIClient:
 
         return {
             "success": True,
-            "message": "Connected successfully to 3X-UI panel",
+            "message": f"اتصال به پنل 3X-UI با موفقیت برقرار شد ({len(inbounds)} اینباند شناسایی گردید)",
             "latency_ms": duration_ms,
             "inbounds_count": len(inbounds),
-            "base_url": base_url
+            "base_url": self._get_base_url()
         }
 
     async def get_inbounds(self) -> Dict[str, Any]:
         """Fetch all inbounds from 3X-UI panel"""
         session = await self._ensure_session()
         base_url = self._get_base_url()
+        parsed = urllib.parse.urlsplit(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": origin,
+            "Referer": f"{base_url}/"
+        }
+        token = config.get("xui_token", "")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
         endpoints = [
             f"{base_url}/panel/api/inbounds/list",
             f"{base_url}/xui/API/inbounds/"
         ]
+        if parsed.path and parsed.path != "/":
+            endpoints.append(f"{origin}/panel/api/inbounds/list")
+            endpoints.append(f"{origin}/xui/API/inbounds/")
 
         for url in endpoints:
             try:
-                headers = {"Accept": "application/json"}
-                token = config.get("xui_token", "")
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
-
                 async with session.get(url, headers=headers) as resp:
-                    if resp.status == 401 or resp.status == 403:
+                    if resp.status in (401, 403):
                         # Session may have expired, re-login once
                         logged, _ = await self.login()
                         if not logged:
@@ -147,14 +235,30 @@ class XUIClient:
         await self.login()
         return {"success": False, "msg": "Failed to retrieve inbounds list", "obj": []}
 
+    def _get_headers(self) -> Dict[str, str]:
+        base_url = self._get_base_url()
+        parsed = urllib.parse.urlsplit(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": origin,
+            "Referer": f"{base_url}/"
+        }
+        token = config.get("xui_token", "")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
     async def get_inbound(self, inbound_id: int) -> Optional[Dict[str, Any]]:
         """Fetch details of a single inbound by ID"""
         session = await self._ensure_session()
         base_url = self._get_base_url()
         url = f"{base_url}/panel/api/inbounds/get/{inbound_id}"
+        headers = self._get_headers()
         
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("success"):
@@ -206,8 +310,9 @@ class XUIClient:
             "settings": json.dumps({"clients": [client_settings]})
         }
 
+        headers = self._get_headers()
         try:
-            async with session.post(url, json=payload) as resp:
+            async with session.post(url, json=payload, headers=headers) as resp:
                 text = await resp.text()
                 try:
                     data = json.loads(text)
@@ -247,9 +352,10 @@ class XUIClient:
             "id": inbound_id,
             "settings": json.dumps({"clients": [client_settings]})
         }
+        headers = self._get_headers()
 
         try:
-            async with session.post(url, json=payload) as resp:
+            async with session.post(url, json=payload, headers=headers) as resp:
                 data = await resp.json()
                 if data.get("success"):
                     return True, "Client updated"
@@ -262,9 +368,10 @@ class XUIClient:
         session = await self._ensure_session()
         base_url = self._get_base_url()
         url = f"{base_url}/panel/api/inbounds/delClient/{inbound_id}/{client_uuid}"
+        headers = self._get_headers()
 
         try:
-            async with session.post(url) as resp:
+            async with session.post(url, headers=headers) as resp:
                 data = await resp.json()
                 if data.get("success"):
                     return True, "Client deleted from 3X-UI"
@@ -277,9 +384,10 @@ class XUIClient:
         session = await self._ensure_session()
         base_url = self._get_base_url()
         url = f"{base_url}/panel/api/inbounds/getClientTraffics/{email}"
+        headers = self._get_headers()
 
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("success"):

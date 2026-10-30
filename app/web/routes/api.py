@@ -232,8 +232,23 @@ async def restart_bot_service(admin: Dict[str, Any] = Depends(get_current_admin)
     except Exception as e:
         return {"success": False, "message": f"خطا در ریستارت سرویس ربات: {str(e)}"}
 
+class XUITestRequest(BaseModel):
+    xui_url: Optional[str] = None
+    xui_username: Optional[str] = None
+    xui_password: Optional[str] = None
+    xui_token: Optional[str] = None
+
 @api_router.post("/settings/test-xui")
-async def test_xui(admin: Dict[str, Any] = Depends(get_current_admin)):
+async def test_xui(req: Optional[XUITestRequest] = None, admin: Dict[str, Any] = Depends(get_current_admin)):
+    if req:
+        if req.xui_url:
+            config.set("xui_url", req.xui_url.strip())
+        if req.xui_username:
+            config.set("xui_username", req.xui_username.strip())
+        if req.xui_password and "••••" not in req.xui_password:
+            config.set("xui_password", req.xui_password.strip())
+        if req.xui_token:
+            config.set("xui_token", req.xui_token.strip())
     return await xui_client.test_connection()
 
 # --- 4. Inbound Manager ---

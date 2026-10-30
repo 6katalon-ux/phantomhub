@@ -5,7 +5,7 @@ import { AppSettings } from '../../types';
 interface XUIConnectionTabProps {
   settings: AppSettings;
   onSave: (updated: Partial<AppSettings>) => Promise<void>;
-  onTestConnection: () => Promise<any>;
+  onTestConnection: (data?: Partial<AppSettings>) => Promise<any>;
   isRtl: boolean;
 }
 
@@ -41,7 +41,7 @@ export const XUIConnectionTab: React.FC<XUIConnectionTabProps> = ({
     setTesting(true);
     setTestResult(null);
     try {
-      const res = await onTestConnection();
+      const res = await onTestConnection(formData);
       setTestResult(res);
     } catch (e: any) {
       setTestResult({ success: false, message: e.message || 'خطا در برقراری ارتباط' });
