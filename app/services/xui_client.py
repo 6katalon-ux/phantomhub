@@ -26,14 +26,13 @@ class XUIClient:
     def _get_candidate_urls(self) -> List[str]:
         raw = self._clean_url(config.get("xui_url", "http://127.0.0.1:2053"))
         candidates: List[str] = []
-        if raw.startswith("http://") or raw.startswith("https://"):
+        if raw.startswith("https://"):
             candidates.append(raw)
-            if raw.startswith("http://"):
-                candidates.append("https://" + raw[7:])
-            elif raw.startswith("https://"):
-                candidates.append("http://" + raw[8:])
+            # Never downgrade https:// to plain http:// when connecting to TLS ports
+        elif raw.startswith("http://"):
+            candidates.append(raw)
+            candidates.append("https://" + raw[7:])
         else:
-            # If domain or port 2053, try https first then http
             candidates.append(f"https://{raw}")
             candidates.append(f"http://{raw}")
         return candidates
@@ -360,7 +359,7 @@ class XUIClient:
     ) -> Tuple[bool, str]:
         """
         Add a client to a specific inbound in 3X-UI.
-        Handles token & cookie authentication, dynamic URL discovery, and payload format variants.
+        Supports both modern 3X-UI (/panel/api/clients/add) and legacy versions (/panel/api/inbounds/addClient).
         """
         session = await self._ensure_session()
 
@@ -386,7 +385,7 @@ class XUIClient:
             security = stream.get("security", "none")
             network = stream.get("network", "tcp")
 
-        # 2. Determine flow based on protocol & reality/tls
+        # 2. Flow: xtls-rprx-vision is ONLY valid on TCP network with reality or tls!
         effective_flow = ""
         if flow is not None:
             effective_flow = flow
@@ -424,19 +423,44 @@ class XUIClient:
             if c not in candidate_bases:
                 candidate_bases.append(c)
 
-        urls_to_try = []
+        last_error = ""
+
+        # STRATEGY 1: Modern 3X-UI (MHSanaei v2/v3): POST /panel/api/clients/add
+        # Payload: {"inboundIds": [int(inbound_id)], "client": client_settings}
+        modern_payload = {
+            "inboundIds": [int(inbound_id)],
+            "client": client_settings
+        }
         for b in candidate_bases:
             b_clean = b.rstrip("/")
-            parsed = urllib.parse.urlsplit(b_clean)
-            origin = f"{parsed.scheme}://{parsed.netloc}"
-            for p in ["/panel/api/inbounds/addClient", "/panel/inbound/addClient", "/xui/API/inbounds/addClient", "/xui/inbound/addClient"]:
-                u1 = f"{b_clean}{p}"
-                if u1 not in urls_to_try:
-                    urls_to_try.append(u1)
-                if parsed.path and parsed.path != "/":
-                    u2 = f"{origin}{p}"
-                    if u2 not in urls_to_try:
-                        urls_to_try.append(u2)
+            target_url = f"{b_clean}/panel/api/clients/add"
+            try:
+                async with session.post(target_url, json=modern_payload, headers=headers, params=params) as resp:
+                    text = await resp.text()
+                    logger.info(f"3X-UI modern clients/add to {target_url}: HTTP {resp.status}")
+                    if resp.status == 200:
+                        try:
+                            data = json.loads(text)
+                            if data.get("success"):
+                                self._active_base_url = b_clean
+                                return True, "Client created successfully"
+                            last_error = data.get("msg", text[:120])
+                        except Exception:
+                            return True, "Client created"
+                    elif resp.status in (401, 403) and not token:
+                        await self.login()
+                    elif resp.status != 404:
+                        last_error = f"HTTP {resp.status}: {text[:100]}"
+            except Exception as e:
+                last_error = f"Network error ({target_url}): {str(e)}"
+
+        # STRATEGY 2: Legacy 3X-UI: POST /panel/api/inbounds/addClient or /panel/inbound/addClient
+        legacy_urls = []
+        for b in candidate_bases:
+            b_clean = b.rstrip("/")
+            legacy_urls.append(f"{b_clean}/panel/api/inbounds/addClient")
+            legacy_urls.append(f"{b_clean}/panel/inbound/addClient")
+            legacy_urls.append(f"{b_clean}/xui/API/inbounds/addClient")
 
         payload_json = {
             "id": int(inbound_id),
@@ -446,24 +470,16 @@ class XUIClient:
             "id": str(inbound_id),
             "settings": json.dumps({"clients": [client_settings]})
         }
-        payload_nested = {
-            "id": int(inbound_id),
-            "settings": {"clients": [client_settings]}
-        }
 
-        last_error = ""
-        for target_url in urls_to_try:
-            # Try both JSON and Form encodings (different 3X-UI forks expect different Content-Types)
+        for target_url in legacy_urls:
             attempts = [
-                ("json_string", {"json": payload_json}),
-                ("form_data", {"data": payload_form}),
-                ("json_nested", {"json": payload_nested})
+                ("json", {"json": payload_json}),
+                ("form", {"data": payload_form})
             ]
             for fmt_name, req_kwargs in attempts:
                 try:
                     async with session.post(target_url, headers=headers, params=params, **req_kwargs) as resp:
                         text = await resp.text()
-                        logger.info(f"3X-UI addClient to {target_url} ({fmt_name}): HTTP {resp.status}")
                         if resp.status == 200:
                             try:
                                 data = json.loads(text)
@@ -473,15 +489,12 @@ class XUIClient:
                                 last_error = data.get("msg", text[:120])
                             except Exception:
                                 return True, "Client created"
-                        elif resp.status in (401, 403) and not token:
-                            # Session expired, re-login once
-                            await self.login()
-                        elif resp.status != 404:
+                        elif resp.status not in (404, 401, 403):
                             last_error = f"HTTP {resp.status}: {text[:100]}"
                 except Exception as e:
                     last_error = f"Network error ({target_url}): {str(e)}"
 
-        return False, last_error or "Failed to add client to 3X-UI (Inbound ID not found or endpoint unavailable)"
+        return False, last_error or "Failed to add client to 3X-UI"
 
     async def update_client(
         self,
@@ -507,25 +520,38 @@ class XUIClient:
         }
 
         candidate_bases = [self._active_base_url] if self._active_base_url else self._get_candidate_urls()
-        urls_to_try = []
+        
+        # 1. Modern 3X-UI update: POST /panel/api/clients/update/{client_uuid}
+        modern_payload = {
+            "inboundIds": [int(inbound_id)],
+            "client": client_settings
+        }
         for b in candidate_bases:
             b_clean = b.rstrip("/")
-            urls_to_try.append(f"{b_clean}/panel/api/inbounds/updateClient/{client_uuid}")
-            urls_to_try.append(f"{b_clean}/panel/inbound/updateClient/{client_uuid}")
+            url = f"{b_clean}/panel/api/clients/update/{client_uuid}"
+            try:
+                async with session.post(url, json=modern_payload, headers=headers, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("success"):
+                            return True, "Client updated"
+            except Exception:
+                pass
 
+        # 2. Legacy update: POST /panel/api/inbounds/updateClient/{client_uuid}
         payload_json = {
             "id": int(inbound_id),
             "settings": json.dumps({"clients": [client_settings]})
         }
-        payload_form = {
-            "id": str(inbound_id),
-            "settings": json.dumps({"clients": [client_settings]})
-        }
-
-        for target_url in urls_to_try:
-            for req_kwargs in [{"json": payload_json}, {"data": payload_form}]:
+        for b in candidate_bases:
+            b_clean = b.rstrip("/")
+            urls = [
+                f"{b_clean}/panel/api/inbounds/updateClient/{client_uuid}",
+                f"{b_clean}/panel/inbound/updateClient/{client_uuid}"
+            ]
+            for target_url in urls:
                 try:
-                    async with session.post(target_url, headers=headers, params=params, **req_kwargs) as resp:
+                    async with session.post(target_url, json=payload_json, headers=headers, params=params) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             if data.get("success"):
@@ -535,7 +561,7 @@ class XUIClient:
 
         return False, "Update failed"
 
-    async def delete_client(self, inbound_id: int, client_uuid: str) -> Tuple[bool, str]:
+    async def delete_client(self, inbound_id: int, client_uuid: str, email: str = "") -> Tuple[bool, str]:
         """Delete client from 3X-UI"""
         session = await self._ensure_session()
         token = str(config.get("xui_token", "")).strip()
@@ -543,22 +569,39 @@ class XUIClient:
         headers = self._get_headers()
 
         candidate_bases = [self._active_base_url] if self._active_base_url else self._get_candidate_urls()
-        urls_to_try = []
+        
+        # 1. Modern 3X-UI delete: POST /panel/api/clients/del/{uuid_or_email}
+        identifiers = [x for x in [email, client_uuid] if x]
         for b in candidate_bases:
             b_clean = b.rstrip("/")
-            urls_to_try.append(f"{b_clean}/panel/api/inbounds/delClient/{inbound_id}/{client_uuid}")
-            urls_to_try.append(f"{b_clean}/panel/api/inbounds/delClient/{client_uuid}")
-            urls_to_try.append(f"{b_clean}/panel/inbound/delClient/{client_uuid}")
+            for ident in identifiers:
+                url = f"{b_clean}/panel/api/clients/del/{ident}"
+                try:
+                    async with session.post(url, headers=headers, params=params) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success"):
+                                return True, "Client deleted from 3X-UI"
+                except Exception:
+                    pass
 
-        for target_url in urls_to_try:
-            try:
-                async with session.post(target_url, headers=headers, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("success"):
-                            return True, "Client deleted from 3X-UI"
-            except Exception:
-                pass
+        # 2. Legacy 3X-UI delete
+        for b in candidate_bases:
+            b_clean = b.rstrip("/")
+            urls = [
+                f"{b_clean}/panel/api/inbounds/delClient/{inbound_id}/{client_uuid}",
+                f"{b_clean}/panel/api/inbounds/delClient/{client_uuid}",
+                f"{b_clean}/panel/inbound/delClient/{client_uuid}"
+            ]
+            for target_url in urls:
+                try:
+                    async with session.post(target_url, headers=headers, params=params) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success"):
+                                return True, "Client deleted from 3X-UI"
+                except Exception:
+                    pass
 
         return False, "Delete failed"
 
@@ -588,8 +631,12 @@ class XUIClient:
         port = inbound.get("port", 443)
         host = config.get("vpn_server_host", "").strip()
         if not host or host in ("127.0.0.1", "localhost"):
-            parsed_xui = urllib.parse.urlsplit(self._get_base_url())
-            host = parsed_xui.hostname or "127.0.0.1"
+            share_addr = str(inbound.get("shareAddr") or "").strip()
+            if share_addr and share_addr not in ("0.0.0.0", "127.0.0.1", "localhost"):
+                host = share_addr
+            else:
+                parsed_xui = urllib.parse.urlsplit(self._get_base_url())
+                host = parsed_xui.hostname or "127.0.0.1"
         
         # Parse streamSettings and settings JSON
         stream = {}
@@ -634,15 +681,19 @@ class XUIClient:
                 server_names = reality_settings.get("serverNames") or settings_data.get("serverNames", [])
                 sni = server_names[0] if server_names else host
                 
-                fp = reality_settings.get("fingerprint", "chrome")
+                fp = reality_settings.get("fingerprint") or settings_data.get("fingerprint", "chrome")
+                spx = reality_settings.get("spiderX") or settings_data.get("spiderX", "")
 
                 params["pbk"] = pbk
                 params["fp"] = fp
                 params["sni"] = sni
                 if sid:
                     params["sid"] = sid
+                if spx:
+                    params["spx"] = spx
                 params["type"] = network
-                params["flow"] = "xtls-rprx-vision"
+                if network == "tcp":
+                    params["flow"] = "xtls-rprx-vision"
             
             elif security == "tls":
                 params["security"] = "tls"
@@ -661,7 +712,14 @@ class XUIClient:
                 params["host"] = ws_settings.get("headers", {}).get("Host", host)
             elif network == "grpc":
                 grpc_settings = stream.get("grpcSettings", {})
-                params["serviceName"] = grpc_settings.get("serviceName", "")
+                if isinstance(grpc_settings, str):
+                    try:
+                        grpc_settings = json.loads(grpc_settings)
+                    except Exception:
+                        grpc_settings = {}
+                service_name = grpc_settings.get("serviceName", "")
+                if service_name:
+                    params["serviceName"] = service_name
 
             query = urllib.parse.urlencode(params)
             return f"vless://{client_uuid}@{host}:{port}?{query}#{clean_remark}"
