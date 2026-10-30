@@ -27,7 +27,13 @@ class XUIClient:
                 url = "https://" + url[7:]
         elif not url.startswith("https://"):
             url = f"https://{url}"
-        return url
+
+        # Strip browser page suffixes if user pasted full browser URL
+        for suffix in ["/panel/clients", "/panel/inbounds", "/panel/inbound", "/panel/settings", "/panel"]:
+            if url.endswith(suffix):
+                url = url[:-len(suffix)].rstrip("/")
+                break
+        return url.rstrip("/")
 
     def _get_candidate_urls(self) -> List[str]:
         raw = self._clean_url(config.get("xui_url", "https://127.0.0.1:2053"))
