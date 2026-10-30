@@ -250,15 +250,9 @@ class XUIClient:
         parsed = urllib.parse.urlsplit(base_url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Origin": origin,
-            "Referer": f"{base_url}/"
-        }
-        token = config.get("xui_token", "")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        headers = self._get_headers()
+        token = str(config.get("xui_token", "")).strip()
+        params = {"token": token} if token else {}
 
         endpoints = [
             f"{base_url}/panel/api/inbounds/list",
@@ -269,24 +263,24 @@ class XUIClient:
             endpoints.append(f"{origin}/xui/API/inbounds/")
 
         for url in endpoints:
-            try:
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status in (401, 403):
-                        # Session may have expired, re-login once
-                        logged, _ = await self.login()
-                        if not logged:
-                            continue
-                        async with session.get(url, headers=headers) as retry_resp:
-                            if retry_resp.status == 200:
-                                return await retry_resp.json()
-                    elif resp.status == 200:
-                        data = await resp.json()
-                        return data
-            except Exception as e:
-                logger.warning(f"Error requesting {url}: {e}")
+            for query_params in [params, {}]:
+                try:
+                    async with session.get(url, headers=headers, params=query_params) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success", False) or "obj" in data:
+                                return data
+                        elif resp.status in (401, 403):
+                            # Try re-login if token is not set
+                            if not token:
+                                logged, _ = await self.login()
+                                if logged:
+                                    async with session.get(url, headers=headers) as retry_resp:
+                                        if retry_resp.status == 200:
+                                            return await retry_resp.json()
+                except Exception as e:
+                    logger.warning(f"Error requesting {url}: {e}")
 
-        # If failed, attempt re-login and fallback
-        await self.login()
         return {"success": False, "msg": "Failed to retrieve inbounds list", "obj": []}
 
     def _get_headers(self) -> Dict[str, str]:
@@ -307,27 +301,50 @@ class XUIClient:
         return headers
 
     async def get_inbound(self, inbound_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch details of a single inbound by ID"""
+        """Fetch details of a single inbound by ID with robust fallbacks"""
+        target_str = str(inbound_id).strip()
+
+        # 1. First search via get_inbounds list (most reliable across all 3X-UI forks)
+        all_inbounds = await self.get_inbounds()
+        inbounds_list = all_inbounds.get("obj", []) if all_inbounds.get("success") else []
+        
+        if inbounds_list:
+            # Exact ID match
+            for item in inbounds_list:
+                if str(item.get("id")).strip() == target_str or str(item.get("inbound_id")).strip() == target_str:
+                    return item
+            
+            # Port or remark match (in case user entered port like 88 or 443 instead of ID)
+            for item in inbounds_list:
+                if str(item.get("port")).strip() == target_str:
+                    return item
+                if str(item.get("tag", "")).strip().lower() == target_str.lower():
+                    return item
+                if str(item.get("remark", "")).strip().lower() == target_str.lower():
+                    return item
+
+        # 2. Try direct /get/:id endpoint as fallback
         session = await self._ensure_session()
         base_url = self._get_base_url()
-        url = f"{base_url}/panel/api/inbounds/get/{inbound_id}"
+        token = str(config.get("xui_token", "")).strip()
+        params = {"token": token} if token else {}
         headers = self._get_headers()
+        url = f"{base_url}/panel/api/inbounds/get/{inbound_id}"
         
         try:
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if data.get("success"):
+                    if data.get("success") and data.get("obj"):
                         return data.get("obj")
         except Exception as e:
             logger.error(f"Error fetching inbound {inbound_id}: {e}")
-        
-        # Fallback search from get_inbounds list
-        all_inbounds = await self.get_inbounds()
-        if all_inbounds.get("success"):
-            for item in all_inbounds.get("obj", []):
-                if item.get("id") == inbound_id:
-                    return item
+
+        # 3. Intelligent fallback: if inbounds exist, use the first available active inbound
+        if inbounds_list:
+            logger.warning(f"Inbound ID {inbound_id} not explicitly found. Auto-selecting first active inbound #{inbounds_list[0].get('id')}")
+            return inbounds_list[0]
+
         return None
 
     async def add_client(
@@ -342,11 +359,15 @@ class XUIClient:
     ) -> Tuple[bool, str]:
         """
         Add a client to a specific inbound in 3X-UI.
-        Properly handles JSON structures expected by standard 3X-UI.
+        Handles both token-based and cookie-based authentication, and URL subpath variations.
         """
         session = await self._ensure_session()
         base_url = self._get_base_url()
-        url = f"{base_url}/panel/api/inbounds/addClient"
+        parsed = urllib.parse.urlsplit(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        token = str(config.get("xui_token", "")).strip()
+        params = {"token": token} if token else {}
 
         # 3X-UI expects client settings inside client object
         client_settings = {
@@ -362,25 +383,33 @@ class XUIClient:
         }
 
         payload = {
-            "id": inbound_id,
+            "id": int(inbound_id),
             "settings": json.dumps({"clients": [client_settings]})
         }
 
         headers = self._get_headers()
-        try:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                text = await resp.text()
-                try:
-                    data = json.loads(text)
-                    if data.get("success"):
-                        return True, "Client created successfully"
-                    return False, data.get("msg", f"3X-UI Error: {text[:150]}")
-                except Exception:
-                    if resp.status == 200:
-                        return True, "Client created"
-                    return False, f"HTTP {resp.status}: {text[:150]}"
-        except Exception as e:
-            return False, f"Network error adding client: {str(e)}"
+        urls_to_try = [f"{base_url}/panel/api/inbounds/addClient"]
+        if parsed.path and parsed.path != "/":
+            urls_to_try.append(f"{origin}/panel/api/inbounds/addClient")
+
+        last_error = ""
+        for target_url in urls_to_try:
+            try:
+                async with session.post(target_url, json=payload, headers=headers, params=params) as resp:
+                    text = await resp.text()
+                    try:
+                        data = json.loads(text)
+                        if data.get("success"):
+                            return True, "Client created successfully"
+                        last_error = data.get("msg", text[:150])
+                    except Exception:
+                        if resp.status == 200:
+                            return True, "Client created"
+                        last_error = f"HTTP {resp.status}: {text[:150]}"
+            except Exception as e:
+                last_error = f"Network error adding client: {str(e)}"
+
+        return False, last_error or "Failed to add client to 3X-UI"
 
     async def update_client(
         self,

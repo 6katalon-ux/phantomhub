@@ -24,6 +24,7 @@ class ConfigManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(ConfigManager, cls).__new__(cls)
+            cls._instance._last_refresh = 0.0
             cls._instance._load_secrets()
             cls._instance.refresh_cache_sync()
         return cls._instance
@@ -55,6 +56,8 @@ class ConfigManager:
 
     def refresh_cache_sync(self):
         """Synchronously query SQLite and populate settings cache"""
+        import time
+        self._last_refresh = time.time()
         if not DB_PATH.exists():
             return
         try:
@@ -77,6 +80,11 @@ class ConfigManager:
             pass
 
     def get(self, key: str, default: Any = "") -> Any:
+        import time
+        # Periodically refresh settings cache every 3 seconds to sync changes from web panel to bot process
+        if time.time() - getattr(self, "_last_refresh", 0.0) > 3.0:
+            self.refresh_cache_sync()
+
         if key in self._cache:
             return self._cache[key]["value"]
         # Fallback to direct DB query if not in cache
