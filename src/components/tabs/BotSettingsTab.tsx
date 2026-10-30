@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Bot, Save, AlertCircle, CheckCircle2, ShieldAlert } from 'lucide-react';
+import { Bot, Save, AlertCircle, CheckCircle2, ShieldAlert, Activity, RefreshCw } from 'lucide-react';
 import { AppSettings } from '../../types';
+import { api } from '../../services/api';
 
 interface BotSettingsTabProps {
   settings: AppSettings;
@@ -22,6 +23,8 @@ export const BotSettingsTab: React.FC<BotSettingsTabProps> = ({
     bot_maintenance: settings.bot_maintenance ?? false
   });
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; message: string; bot?: any } | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -30,9 +33,38 @@ export const BotSettingsTab: React.FC<BotSettingsTabProps> = ({
     setSaving(false);
   };
 
+  const handleTestBot = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      // First save if edited
+      if (formData.bot_token !== settings.bot_token) {
+        await onSave(formData);
+      }
+      const res = await api.testBotToken();
+      setTestResult(res);
+    } catch (e: any) {
+      setTestResult({ success: false, message: e.message || 'خطا در ارتباط' });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleRestartBot = async () => {
+    setTesting(true);
+    try {
+      const res = await api.restartBotService();
+      setTestResult({ success: res.success, message: res.message });
+    } catch (e: any) {
+      setTestResult({ success: false, message: e.message || 'خطا در ریستارت سرویس ربات' });
+    } finally {
+      setTesting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-4 border-b border-neutral-800">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-neutral-800">
         <div>
           <h1 className="text-lg font-bold text-neutral-100 flex items-center gap-2">
             <Bot className="w-5 h-5 text-cyan-400" />
@@ -44,7 +76,50 @@ export const BotSettingsTab: React.FC<BotSettingsTabProps> = ({
               : 'Manage BotFather token, admin IDs, and welcome messaging'}
           </p>
         </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleRestartBot}
+            disabled={testing}
+            className="flex items-center gap-1.5 py-2 px-3.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs font-semibold rounded-xl border border-neutral-700/60 transition-all"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 text-cyan-400 ${testing ? 'animate-spin' : ''}`} />
+            <span>{isRtl ? 'ریستارت ربات' : 'Restart Bot'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleTestBot}
+            disabled={testing}
+            className="flex items-center gap-1.5 py-2 px-4 bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 text-xs font-semibold rounded-xl border border-cyan-500/40 transition-all shadow-sm shadow-cyan-950"
+          >
+            <Activity className={`w-3.5 h-3.5 text-cyan-400 ${testing ? 'animate-pulse' : ''}`} />
+            <span>{testing ? (isRtl ? 'در حال بررسی...' : 'Checking...') : (isRtl ? 'تست اتصال ربات' : 'Test Bot Connection')}</span>
+          </button>
+        </div>
       </div>
+
+      {testResult && (
+        <div className={`p-4 rounded-2xl border text-xs flex items-start gap-3 ${
+          testResult.success
+            ? 'bg-emerald-950/30 border-emerald-800/60 text-emerald-300'
+            : 'bg-rose-950/30 border-rose-800/60 text-rose-300'
+        }`}>
+          {testResult.success ? (
+            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+          ) : (
+            <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+          )}
+          <div className="space-y-1">
+            <div className="font-bold">{testResult.message}</div>
+            {testResult.bot && (
+              <div className="font-mono text-[11px] text-emerald-400/80">
+                Bot ID: {testResult.bot.id} | @{testResult.bot.username}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <form onSubmit={handleSubmit} className="space-y-5">
         {/* Token Card */}

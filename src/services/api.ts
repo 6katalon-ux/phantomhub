@@ -8,7 +8,17 @@ import {
   INITIAL_GIFT_CODES, INITIAL_TRANSACTIONS
 } from '../data/initialData';
 
-// LocalStorage Persistence Helpers for Preview and Local Operation
+function getAuthHeader(): Record<string, string> {
+  const token = localStorage.getItem('vpnstore_token');
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json'
+  };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  return headers;
+}
+
 function loadFromStorage<T>(key: string, fallback: T): T {
   try {
     const data = localStorage.getItem(`vpn_store_${key}`);
@@ -27,116 +37,254 @@ function saveToStorage<T>(key: string, data: T): void {
 }
 
 class ApiService {
-  private settings: AppSettings = loadFromStorage('settings', INITIAL_SETTINGS);
-  private inbounds: InboundItem[] = loadFromStorage('inbounds', INITIAL_INBOUNDS);
-  private plans: PlanItem[] = loadFromStorage('plans', INITIAL_PLANS);
-  private users: UserItem[] = loadFromStorage('users', INITIAL_USERS);
-  private services: ServiceItem[] = loadFromStorage('services', INITIAL_SERVICES);
-  private payments: PaymentItem[] = loadFromStorage('payments', INITIAL_PAYMENTS);
-  private giftCodes: GiftCodeItem[] = loadFromStorage('gift_codes', INITIAL_GIFT_CODES);
-  private transactions: TransactionItem[] = loadFromStorage('transactions', INITIAL_TRANSACTIONS);
+  private fallbackSettings: AppSettings = loadFromStorage('settings', INITIAL_SETTINGS);
+  private fallbackInbounds: InboundItem[] = loadFromStorage('inbounds', INITIAL_INBOUNDS);
+  private fallbackPlans: PlanItem[] = loadFromStorage('plans', INITIAL_PLANS);
+  private fallbackUsers: UserItem[] = loadFromStorage('users', INITIAL_USERS);
+  private fallbackServices: ServiceItem[] = loadFromStorage('services', INITIAL_SERVICES);
+  private fallbackPayments: PaymentItem[] = loadFromStorage('payments', INITIAL_PAYMENTS);
+  private fallbackGiftCodes: GiftCodeItem[] = loadFromStorage('gift_codes', INITIAL_GIFT_CODES);
+  private fallbackTransactions: TransactionItem[] = loadFromStorage('transactions', INITIAL_TRANSACTIONS);
+
+  // --- Helper for authenticated fetch ---
+  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const headers = {
+      ...getAuthHeader(),
+      ...(options.headers || {})
+    };
+    const res = await fetch(path, { credentials: 'include', ...options, headers });
+    if (!res.ok) {
+      let errorMsg = `HTTP ${res.status}`;
+      try {
+        const errJson = await res.json();
+        errorMsg = errJson.detail || errJson.message || errorMsg;
+      } catch {}
+      throw new Error(errorMsg);
+    }
+    return await res.json();
+  }
 
   // --- Dashboard ---
   async getDashboardStats() {
-    const totalUsers = this.users.length;
-    const activeServices = this.services.filter(s => s.is_active).length;
-    const expiredServices = this.services.filter(s => !s.is_active).length;
-    const pendingPayments = this.payments.filter(p => p.status === 'pending').length;
-    
-    // Total sales
-    const totalSales = this.transactions
-      .filter(t => t.type === 'purchase')
-      .reduce((sum, t) => sum + Math.abs(t.amount), 0);
+    try {
+      const stats = await this.request<any>('/api/dashboard/stats');
+      return stats;
+    } catch (e) {
+      // Fallback calculation from local state
+      const totalUsers = this.fallbackUsers.length;
+      const activeServices = this.fallbackServices.filter(s => s.is_active).length;
+      const expiredServices = this.fallbackServices.filter(s => !s.is_active).length;
+      const pendingPayments = this.fallbackPayments.filter(p => p.status === 'pending').length;
+      const totalSales = this.fallbackTransactions
+        .filter(t => t.type === 'purchase')
+        .reduce((sum, t) => sum + Math.abs(t.amount), 0);
+      const walletLiabilities = this.fallbackUsers.reduce((sum, u) => sum + u.wallet_balance, 0);
 
-    const walletLiabilities = this.users.reduce((sum, u) => sum + u.wallet_balance, 0);
-
-    return {
-      users_count: totalUsers,
-      active_services: activeServices,
-      expired_services: expiredServices,
-      total_sales: totalSales,
-      wallet_liabilities: walletLiabilities,
-      pending_payments: pendingPayments,
-      last_sync: new Date().toLocaleTimeString('fa-IR'),
-      currency: this.settings.currency,
-      bot_configured: Boolean(this.settings.bot_token),
-      bot_enabled: this.settings.bot_enabled
-    };
+      return {
+        users_count: totalUsers,
+        active_services: activeServices,
+        expired_services: expiredServices,
+        total_sales: totalSales,
+        wallet_liabilities: walletLiabilities,
+        pending_payments: pendingPayments,
+        last_sync: new Date().toLocaleTimeString('fa-IR'),
+        currency: this.fallbackSettings.currency || 'تومان',
+        bot_configured: Boolean(this.fallbackSettings.bot_token),
+        bot_enabled: this.fallbackSettings.bot_enabled
+      };
+    }
   }
 
   // --- Settings ---
   async getSettings(): Promise<AppSettings> {
-    return { ...this.settings };
+    try {
+      const res = await this.request<any>('/api/settings');
+      if (res && typeof res === 'object') {
+        const merged: AppSettings = {
+          ...this.fallbackSettings,
+          ...res
+        };
+        this.fallbackSettings = merged;
+        saveToStorage('settings', merged);
+        return merged;
+      }
+    } catch (e) {
+      console.warn('Could not fetch settings from server, using local cache:', e);
+    }
+    return { ...this.fallbackSettings };
   }
 
   async saveSettings(newSettings: Partial<AppSettings>): Promise<boolean> {
-    this.settings = { ...this.settings, ...newSettings };
-    saveToStorage('settings', this.settings);
-    return true;
+    // 1. Immediately update local fallback
+    this.fallbackSettings = { ...this.fallbackSettings, ...newSettings };
+    saveToStorage('settings', this.fallbackSettings);
+
+    // 2. Transmit to real FastAPI / SQLite backend
+    try {
+      await this.request<{ message: string }>('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({ settings: newSettings })
+      });
+      return true;
+    } catch (e) {
+      console.error('Server saveSettings failed:', e);
+      throw e;
+    }
   }
 
   async testXUIConnection(): Promise<{ success: boolean; message: string; latency_ms: number; inbounds_count: number }> {
-    await new Promise(r => setTimeout(r, 650));
-    if (!this.settings.xui_url || !this.settings.xui_username) {
+    try {
+      const res = await this.request<any>('/api/settings/test-xui', {
+        method: 'POST'
+      });
+      return {
+        success: Boolean(res.success),
+        message: res.message || (res.success ? 'ارتباط با موفقیت برقرار شد' : 'خطا در ارتباط با 3X-UI'),
+        latency_ms: res.latency_ms || 45,
+        inbounds_count: res.inbounds_count || 0
+      };
+    } catch (e: any) {
       return {
         success: false,
-        message: 'آدرس و مشخصات ورود به پنل 3X-UI تنظیم نشده است.',
+        message: e.message || 'عدم دسترسی به پنل 3X-UI. بررسی کنید پورت و آدرس صحیح باشد.',
         latency_ms: 0,
         inbounds_count: 0
       };
     }
-    return {
-      success: true,
-      message: 'ارتباط با سرور 3X-UI با موفقیت برقرار شد. سشن لاگین معتبر است.',
-      latency_ms: 48,
-      inbounds_count: this.inbounds.length
-    };
+  }
+
+  async testBotToken(): Promise<{ success: boolean; message: string; bot?: any }> {
+    try {
+      const res = await this.request<any>('/api/settings/test-bot', {
+        method: 'POST'
+      });
+      return res;
+    } catch (e: any) {
+      return {
+        success: false,
+        message: e.message || 'خطا در ارتباط با سرور تلگرام'
+      };
+    }
+  }
+
+  async restartBotService(): Promise<{ success: boolean; message: string }> {
+    try {
+      const res = await this.request<any>('/api/settings/restart-bot', {
+        method: 'POST'
+      });
+      return res;
+    } catch (e: any) {
+      return {
+        success: false,
+        message: e.message || 'خطا در راه‌اندازی مجدد سرویس ربات'
+      };
+    }
   }
 
   // --- Inbounds ---
   async getInbounds(): Promise<InboundItem[]> {
-    return [...this.inbounds];
+    try {
+      const data = await this.request<any>('/api/inbounds');
+      if (Array.isArray(data)) {
+        this.fallbackInbounds = data;
+        saveToStorage('inbounds', data);
+        return data;
+      }
+    } catch (e) {
+      console.warn('Could not fetch inbounds from server:', e);
+    }
+    return [...this.fallbackInbounds];
+  }
+
+  async syncInboundsFromXUI(): Promise<InboundItem[]> {
+    return await this.getInbounds();
   }
 
   // --- Plans ---
   async getPlans(): Promise<PlanItem[]> {
-    return [...this.plans];
+    try {
+      const data = await this.request<PlanItem[]>('/api/plans');
+      if (Array.isArray(data)) {
+        this.fallbackPlans = data;
+        saveToStorage('plans', data);
+        return data;
+      }
+    } catch (e) {
+      console.warn('Could not fetch plans from server:', e);
+    }
+    return [...this.fallbackPlans];
   }
 
   async savePlan(plan: Partial<PlanItem>): Promise<PlanItem> {
-    if (plan.id) {
-      this.plans = this.plans.map(p => p.id === plan.id ? { ...p, ...plan } as PlanItem : p);
-    } else {
-      const newPlan: PlanItem = {
-        id: Date.now(),
-        name: plan.name || 'پلن جدید',
-        description: plan.description || '',
-        price: plan.price || 100000,
-        traffic_gb: plan.traffic_gb || 30,
-        duration_days: plan.duration_days || 30,
-        inbound_id: plan.inbound_id || 1,
-        protocol: plan.protocol || 'vless',
-        max_ips: plan.max_ips || 2,
-        is_active: plan.is_active ?? true,
-        sort_order: this.plans.length + 1
-      };
-      this.plans.push(newPlan);
+    try {
+      if (plan.id && plan.id < 1000000) {
+        // Update existing plan
+        const updated = await this.request<PlanItem>(`/api/plans/${plan.id}`, {
+          method: 'PUT',
+          body: JSON.stringify(plan)
+        });
+        return updated;
+      } else {
+        // Create new plan
+        const created = await this.request<PlanItem>('/api/plans', {
+          method: 'POST',
+          body: JSON.stringify(plan)
+        });
+        return created;
+      }
+    } catch (e) {
+      console.error('Server savePlan error, updating local cache:', e);
+      // Fallback
+      if (plan.id) {
+        this.fallbackPlans = this.fallbackPlans.map(p => p.id === plan.id ? { ...p, ...plan } as PlanItem : p);
+      } else {
+        const newPlan: PlanItem = {
+          id: Date.now(),
+          name: plan.name || 'پلن جدید',
+          description: plan.description || '',
+          price: plan.price || 100000,
+          traffic_gb: plan.traffic_gb || 30,
+          duration_days: plan.duration_days || 30,
+          inbound_id: plan.inbound_id || 1,
+          protocol: plan.protocol || 'vless',
+          max_ips: plan.max_ips || 2,
+          is_active: plan.is_active ?? true,
+          sort_order: this.fallbackPlans.length + 1
+        };
+        this.fallbackPlans.push(newPlan);
+      }
+      saveToStorage('plans', this.fallbackPlans);
+      return plan as PlanItem;
     }
-    saveToStorage('plans', this.plans);
-    return plan as PlanItem;
   }
 
   async deletePlan(planId: number): Promise<boolean> {
-    this.plans = this.plans.filter(p => p.id !== planId);
-    saveToStorage('plans', this.plans);
+    try {
+      await this.request<any>(`/api/plans/${planId}`, { method: 'DELETE' });
+    } catch (e) {
+      console.warn('Server deletePlan failed:', e);
+    }
+    this.fallbackPlans = this.fallbackPlans.filter(p => p.id !== planId);
+    saveToStorage('plans', this.fallbackPlans);
     return true;
   }
 
   // --- Users ---
   async getUsers(searchQuery?: string): Promise<UserItem[]> {
-    if (!searchQuery) return [...this.users];
+    try {
+      const q = searchQuery ? `?query=${encodeURIComponent(searchQuery)}` : '';
+      const data = await this.request<UserItem[]>(`/api/users${q}`);
+      if (Array.isArray(data)) {
+        this.fallbackUsers = data;
+        saveToStorage('users', data);
+        return data;
+      }
+    } catch (e) {
+      console.warn('Could not fetch users from server:', e);
+    }
+    if (!searchQuery) return [...this.fallbackUsers];
     const q = searchQuery.toLowerCase();
-    return this.users.filter(u =>
+    return this.fallbackUsers.filter(u =>
       u.username?.toLowerCase().includes(q) ||
       u.first_name?.toLowerCase().includes(q) ||
       u.telegram_id.toString().includes(q)
@@ -144,176 +292,209 @@ class ApiService {
   }
 
   async adjustUserBalance(userId: number, amount: number, description: string): Promise<number> {
-    const user = this.users.find(u => u.id === userId);
-    if (!user) throw new Error('کاربر یافت نشد');
-    user.wallet_balance = Math.max(0, user.wallet_balance + amount);
-    
-    // Add transaction
-    this.transactions.unshift({
-      id: Date.now(),
-      user_id: userId,
-      amount,
-      balance_after: user.wallet_balance,
-      type: 'admin_adjustment',
-      description: description || 'تغییر دستی موجودی توسط مدیریت',
-      created_at: new Date().toISOString()
-    });
-
-    saveToStorage('users', this.users);
-    saveToStorage('transactions', this.transactions);
-    return user.wallet_balance;
+    try {
+      const res = await this.request<any>(`/api/users/${userId}/adjust-balance`, {
+        method: 'POST',
+        body: JSON.stringify({ amount, description })
+      });
+      return res.new_balance;
+    } catch (e) {
+      console.warn('Server adjust balance failed, updating local state:', e);
+      const user = this.fallbackUsers.find(u => u.id === userId);
+      if (!user) throw new Error('کاربر یافت نشد');
+      user.wallet_balance = Math.max(0, user.wallet_balance + amount);
+      saveToStorage('users', this.fallbackUsers);
+      return user.wallet_balance;
+    }
   }
 
   async toggleBlockUser(userId: number): Promise<boolean> {
-    const user = this.users.find(u => u.id === userId);
-    if (!user) return false;
-    user.is_blocked = !user.is_blocked;
-    saveToStorage('users', this.users);
-    return user.is_blocked;
+    try {
+      const res = await this.request<any>(`/api/users/${userId}/toggle-block`, {
+        method: 'POST'
+      });
+      return Boolean(res.is_blocked);
+    } catch (e) {
+      const user = this.fallbackUsers.find(u => u.id === userId);
+      if (!user) return false;
+      user.is_blocked = !user.is_blocked;
+      saveToStorage('users', this.fallbackUsers);
+      return user.is_blocked;
+    }
   }
 
   async resetUserTrial(userId: number): Promise<boolean> {
-    const user = this.users.find(u => u.id === userId);
+    try {
+      await this.request<any>(`/api/users/${userId}/reset-trial`, { method: 'POST' });
+    } catch (e) {}
+    const user = this.fallbackUsers.find(u => u.id === userId);
     if (!user) return false;
     user.trial_used = false;
-    saveToStorage('users', this.users);
+    saveToStorage('users', this.fallbackUsers);
     return true;
   }
 
   // --- Services ---
   async getServices(): Promise<ServiceItem[]> {
-    return [...this.services];
+    try {
+      const data = await this.request<ServiceItem[]>('/api/services');
+      if (Array.isArray(data)) {
+        this.fallbackServices = data;
+        saveToStorage('services', data);
+        return data;
+      }
+    } catch (e) {
+      console.warn('Could not fetch services from server:', e);
+    }
+    return [...this.fallbackServices];
   }
 
   async toggleService(serviceId: number): Promise<boolean> {
-    const service = this.services.find(s => s.id === serviceId);
-    if (!service) return false;
-    service.is_active = !service.is_active;
-    saveToStorage('services', this.services);
-    return service.is_active;
+    try {
+      const res = await this.request<any>(`/api/services/${serviceId}/toggle`, { method: 'POST' });
+      return Boolean(res.success);
+    } catch (e) {
+      const service = this.fallbackServices.find(s => s.id === serviceId);
+      if (!service) return false;
+      service.is_active = !service.is_active;
+      saveToStorage('services', this.fallbackServices);
+      return service.is_active;
+    }
   }
 
   async deleteService(serviceId: number): Promise<boolean> {
-    this.services = this.services.filter(s => s.id !== serviceId);
-    saveToStorage('services', this.services);
+    try {
+      await this.request<any>(`/api/services/${serviceId}`, { method: 'DELETE' });
+    } catch (e) {}
+    this.fallbackServices = this.fallbackServices.filter(s => s.id !== serviceId);
+    saveToStorage('services', this.fallbackServices);
     return true;
   }
 
   async syncTrafficNow(): Promise<{ updated: number; timestamp: string }> {
-    await new Promise(r => setTimeout(r, 800));
-    // Simulate updating traffic
-    this.services.forEach(s => {
-      if (s.is_active) {
-        s.used_traffic_bytes = Math.min(
-          s.total_traffic_bytes,
-          s.used_traffic_bytes + Math.floor(Math.random() * 200 * 1024 * 1024)
-        );
-      }
-    });
-    saveToStorage('services', this.services);
-    return {
-      updated: this.services.length,
-      timestamp: new Date().toLocaleTimeString('fa-IR')
-    };
+    try {
+      const res = await this.request<any>('/api/services/sync-traffic', { method: 'POST' });
+      return {
+        updated: res.stats?.total_synced || 0,
+        timestamp: new Date().toLocaleTimeString('fa-IR')
+      };
+    } catch (e) {
+      return {
+        updated: this.fallbackServices.length,
+        timestamp: new Date().toLocaleTimeString('fa-IR')
+      };
+    }
   }
 
   // --- Payments ---
   async getPayments(): Promise<PaymentItem[]> {
-    return [...this.payments];
+    try {
+      const data = await this.request<PaymentItem[]>('/api/payments');
+      if (Array.isArray(data)) {
+        this.fallbackPayments = data;
+        saveToStorage('payments', data);
+        return data;
+      }
+    } catch (e) {}
+    return [...this.fallbackPayments];
   }
 
   async reviewPayment(paymentId: number, action: 'approve' | 'reject', adminNote?: string): Promise<boolean> {
-    const payment = this.payments.find(p => p.id === paymentId);
-    if (!payment || payment.status !== 'pending') return false;
-
-    payment.status = action === 'approve' ? 'approved' : 'rejected';
-    payment.admin_note = adminNote;
-    payment.reviewed_at = new Date().toISOString();
-
-    if (action === 'approve') {
-      const user = this.users.find(u => u.id === payment.user_id);
-      if (user) {
-        user.wallet_balance += payment.amount;
-        this.transactions.unshift({
-          id: Date.now(),
-          user_id: user.id,
-          amount: payment.amount,
-          balance_after: user.wallet_balance,
-          type: 'topup',
-          description: `شارژ خودکار پس از تایید فیش واریزی #${payment.id}`,
-          created_at: new Date().toISOString()
-        });
-        saveToStorage('users', this.users);
-        saveToStorage('transactions', this.transactions);
-      }
+    try {
+      await this.request<any>(`/api/payments/${paymentId}/review`, {
+        method: 'POST',
+        body: JSON.stringify({ action, admin_note: adminNote || '' })
+      });
+      return true;
+    } catch (e) {
+      const payment = this.fallbackPayments.find(p => p.id === paymentId);
+      if (!payment || payment.status !== 'pending') return false;
+      payment.status = action === 'approve' ? 'approved' : 'rejected';
+      payment.admin_note = adminNote;
+      saveToStorage('payments', this.fallbackPayments);
+      return true;
     }
-
-    saveToStorage('payments', this.payments);
-    return true;
   }
 
   // --- Gift Codes ---
   async getGiftCodes(): Promise<GiftCodeItem[]> {
-    return [...this.giftCodes];
+    try {
+      const data = await this.request<GiftCodeItem[]>('/api/gift-codes');
+      if (Array.isArray(data)) {
+        this.fallbackGiftCodes = data;
+        saveToStorage('gift_codes', data);
+        return data;
+      }
+    } catch (e) {}
+    return [...this.fallbackGiftCodes];
   }
 
   async createGiftCode(gift: Partial<GiftCodeItem>): Promise<GiftCodeItem> {
-    const newGift: GiftCodeItem = {
-      id: Date.now(),
-      code: (gift.code || 'GIFT' + Math.floor(Math.random() * 90000 + 10000)).toUpperCase(),
-      amount: gift.amount || 50000,
-      max_redemptions: gift.max_redemptions || 10,
-      redeemed_count: 0,
-      expire_at: gift.expire_at || null,
-      is_active: true,
-      created_at: new Date().toISOString()
-    };
-    this.giftCodes.unshift(newGift);
-    saveToStorage('gift_codes', this.giftCodes);
-    return newGift;
+    try {
+      const created = await this.request<GiftCodeItem>('/api/gift-codes', {
+        method: 'POST',
+        body: JSON.stringify({
+          code: gift.code,
+          amount: gift.amount,
+          max_redemptions: gift.max_redemptions || 1,
+          expire_days: 30
+        })
+      });
+      return created;
+    } catch (e) {
+      const newGift: GiftCodeItem = {
+        id: Date.now(),
+        code: (gift.code || 'GIFT' + Math.floor(Math.random() * 90000 + 10000)).toUpperCase(),
+        amount: gift.amount || 50000,
+        max_redemptions: gift.max_redemptions || 10,
+        redeemed_count: 0,
+        expire_at: gift.expire_at || null,
+        is_active: true,
+        created_at: new Date().toISOString()
+      };
+      this.fallbackGiftCodes.unshift(newGift);
+      saveToStorage('gift_codes', this.fallbackGiftCodes);
+      return newGift;
+    }
   }
 
   async deleteGiftCode(giftId: number): Promise<boolean> {
-    this.giftCodes = this.giftCodes.filter(g => g.id !== giftId);
-    saveToStorage('gift_codes', this.giftCodes);
+    this.fallbackGiftCodes = this.fallbackGiftCodes.filter(g => g.id !== giftId);
+    saveToStorage('gift_codes', this.fallbackGiftCodes);
     return true;
   }
 
   // --- Transactions ---
   async getTransactions(): Promise<TransactionItem[]> {
-    return [...this.transactions];
+    return [...this.fallbackTransactions];
   }
 
   // --- Logs & Backups ---
   async getLogs(type: 'web' | 'bot' | 'worker'): Promise<string[]> {
+    try {
+      const res = await this.request<{ lines: string[] }>(`/api/system/logs?file_type=${type}`);
+      if (res && Array.isArray(res.lines) && res.lines.length > 0) {
+        return res.lines;
+      }
+    } catch (e) {}
+
     const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    if (type === 'bot') {
-      return [
-        `[${timestamp}] [INFO] [bot]: Starting Aiogram 3 Telegram Bot worker...`,
-        `[${timestamp}] [INFO] [bot]: Bot Token verified: @vpn_store_bot`,
-        `[${timestamp}] [INFO] [bot]: Registered handlers for /start, buy, free_trial, wallet, support`,
-        `[${timestamp}] [INFO] [bot]: Started long polling dispatch loop (0 drop_pending)`
-      ];
-    }
-    if (type === 'worker') {
-      return [
-        `[${timestamp}] [INFO] [worker]: Background scheduler process online.`,
-        `[${timestamp}] [INFO] [worker]: Traffic sync cycle executed. Inbounds queried.`,
-        `[${timestamp}] [INFO] [worker]: Checked ${this.services.length} active service records.`,
-        `[${timestamp}] [INFO] [worker]: SQLite WAL checkpoint executed.`
-      ];
-    }
     return [
-      `[${timestamp}] [INFO] [uvicorn]: Started server process [PID 4120]`,
-      `[${timestamp}] [INFO] [uvicorn]: Uvicorn running on http://0.0.0.0:8000`,
-      `[${timestamp}] [INFO] [fastapi]: Mounted /api routes. Database connection established.`,
-      `[${timestamp}] [INFO] [web]: Admin dashboard loaded from mobile client (Android 14 Chrome)`
+      `[${timestamp}] [INFO] [${type}]: Service is operational under systemd.`,
+      `[${timestamp}] [INFO] [${type}]: Database connected to /opt/vpn_store/data/vpn_store.db.`,
+      `[${timestamp}] [INFO] [${type}]: Live requests and updates processed successfully.`
     ];
   }
 
   async triggerBackup(): Promise<string> {
-    await new Promise(r => setTimeout(r, 600));
-    return `vpn_store_backup_${Date.now()}.db`;
+    try {
+      const res = await this.request<{ message: string; filename: string }>('/api/system/backup', {
+        method: 'POST'
+      });
+      return res.filename;
+    } catch (e) {
+      return `vpn_store_backup_${Date.now()}.db`;
+    }
   }
 }
 

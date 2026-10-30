@@ -147,16 +147,90 @@ async def get_dashboard_stats(admin: Dict[str, Any] = Depends(get_current_admin)
 # --- 3. Settings Management ---
 @api_router.get("/settings")
 async def get_all_settings(admin: Dict[str, Any] = Depends(get_current_admin)):
-    return config.get_all_masked()
+    config.refresh_cache_sync()
+    flat = {}
+    for k, v in config._cache.items():
+        val = v.get("value", "")
+        # Cast booleans and ints where appropriate
+        if val in ("1", "true", "True", True):
+            flat[k] = True
+        elif val in ("0", "false", "False", False):
+            flat[k] = False
+        elif str(val).isdigit() and k in ("trial_traffic_gb", "trial_duration_days", "sync_interval_mins", "backup_retention_days", "xui_timeout", "xui_default_inbound", "trial_inbound_id"):
+            flat[k] = int(val)
+        else:
+            flat[k] = val
+    return flat
 
 @api_router.post("/settings")
 async def update_settings(req: SettingsUpdateRequest, admin: Dict[str, Any] = Depends(get_current_admin)):
+    bot_changed = False
     for key, val in req.settings.items():
         # Do not overwrite with masked bullets
         if isinstance(val, str) and "••••" in val:
             continue
+        if key in ("bot_token", "bot_enabled"):
+            val_str = str(val).strip() if isinstance(val, str) else str(val)
+            if key == "bot_token":
+                val = val_str
+            if str(val) != str(config.get(key)):
+                bot_changed = True
         config.set(key, val)
+
+    # If bot token or status changed, restart vpnstore-bot systemd service
+    if bot_changed:
+        try:
+            import subprocess
+            subprocess.run(["systemctl", "restart", "vpnstore-bot.service"], timeout=5)
+            logger.info("Restarted vpnstore-bot.service following settings update.")
+        except Exception as e:
+            logger.warning(f"Could not auto-restart vpnstore-bot.service: {e}")
+
     return {"message": "Settings updated successfully"}
+
+@api_router.post("/settings/test-bot")
+async def test_bot(admin: Dict[str, Any] = Depends(get_current_admin)):
+    """Directly verify Telegram Bot Token with Telegram API"""
+    token = config.get("bot_token", "").strip()
+    if not token:
+        return {"success": False, "message": "توکن ربات تلگرام در تنظیمات خالی است. ابتدا توکن را ذخیره نمایید."}
+
+    import aiohttp
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    bot_info = data.get("result", {})
+                    # Ensure service is running
+                    try:
+                        import subprocess
+                        subprocess.run(["systemctl", "restart", "vpnstore-bot.service"], timeout=5)
+                    except Exception:
+                        pass
+                    return {
+                        "success": True,
+                        "message": f"اتصال به تلگرام موفقیت‌آمیز است. ربات: @{bot_info.get('username')} ({bot_info.get('first_name')})",
+                        "bot": bot_info
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "message": f"خطا از تلگرام: {data.get('description', 'توکن نامعتبر است')}"
+                    }
+    except Exception as e:
+        return {"success": False, "message": f"عدم امکان اتصال به سرور تلگرام: {str(e)}"}
+
+@api_router.post("/settings/restart-bot")
+async def restart_bot_service(admin: Dict[str, Any] = Depends(get_current_admin)):
+    """Restart vpnstore-bot systemd service"""
+    try:
+        import subprocess
+        res = subprocess.run(["systemctl", "restart", "vpnstore-bot.service"], capture_output=True, text=True, timeout=10)
+        return {"success": True, "message": "سرویس ربات تلگرام با موفقیت مجدداً راه‌اندازی شد."}
+    except Exception as e:
+        return {"success": False, "message": f"خطا در ریستارت سرویس ربات: {str(e)}"}
 
 @api_router.post("/settings/test-xui")
 async def test_xui(admin: Dict[str, Any] = Depends(get_current_admin)):
@@ -165,8 +239,68 @@ async def test_xui(admin: Dict[str, Any] = Depends(get_current_admin)):
 # --- 4. Inbound Manager ---
 @api_router.get("/inbounds")
 async def get_inbounds(admin: Dict[str, Any] = Depends(get_current_admin)):
-    res = await xui_client.get_inbounds()
-    return res
+    """Fetch and normalize 3X-UI inbounds into structured InboundItem array"""
+    import json
+    raw_res = await xui_client.get_inbounds()
+    items = []
+
+    if raw_res and raw_res.get("success") and "obj" in raw_res:
+        inbounds_list = raw_res.get("obj") or []
+        for obj in inbounds_list:
+            inbound_id = obj.get("id", 1)
+            remark = obj.get("remark") or f"Inbound #{inbound_id}"
+            protocol = obj.get("protocol", "vless")
+            port = obj.get("port", 443)
+            enable = bool(obj.get("enable", True))
+
+            network = "tcp"
+            security = "none"
+            reality_sni = ""
+            total_clients = 0
+
+            # Parse streamSettings
+            stream_raw = obj.get("streamSettings", "")
+            if isinstance(stream_raw, str) and stream_raw:
+                try:
+                    s_data = json.loads(stream_raw)
+                    network = s_data.get("network", "tcp")
+                    security = s_data.get("security", "none")
+                    if security == "reality":
+                        rs = s_data.get("realitySettings", {})
+                        server_names = rs.get("serverNames", [])
+                        if server_names:
+                            reality_sni = server_names[0]
+                except Exception:
+                    pass
+            elif isinstance(stream_raw, dict):
+                network = stream_raw.get("network", "tcp")
+                security = stream_raw.get("security", "none")
+
+            # Parse clients count
+            settings_raw = obj.get("settings", "")
+            if isinstance(settings_raw, str) and settings_raw:
+                try:
+                    set_data = json.loads(settings_raw)
+                    total_clients = len(set_data.get("clients", []))
+                except Exception:
+                    pass
+            elif obj.get("clientStats"):
+                total_clients = len(obj.get("clientStats", []))
+
+            items.append({
+                "id": inbound_id,
+                "inbound_id": inbound_id,
+                "remark": remark,
+                "protocol": protocol,
+                "port": port,
+                "network": network,
+                "security": security,
+                "total_clients": total_clients,
+                "is_enabled": enable,
+                "reality_sni": reality_sni
+            })
+
+    return items
 
 # --- 5. Plans Manager ---
 @api_router.get("/plans")
