@@ -16,7 +16,7 @@ from app.core.logging import logger
 class XUIClient:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
-        self._cookie_jar = aiohttp.CookieJar(unsafe=True)
+        self._cookie_jar: Optional[aiohttp.CookieJar] = None
 
     def _get_base_url(self) -> str:
         url = str(config.get("xui_url", "http://127.0.0.1:2053")).strip().rstrip("/")
@@ -33,6 +33,8 @@ class XUIClient:
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            if self._cookie_jar is None:
+                self._cookie_jar = aiohttp.CookieJar(unsafe=True)
             connector = aiohttp.TCPConnector(ssl=self._get_ssl_verify())
             self._session = aiohttp.ClientSession(
                 cookie_jar=self._cookie_jar,
