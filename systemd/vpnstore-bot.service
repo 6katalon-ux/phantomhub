@@ -1,0 +1,18 @@
+[Unit]
+Description=VPN Store Aiogram 3 Telegram Bot
+After=network.target vpnstore-web.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vpn_store
+ExecStart=/opt/vpn_store/.venv/bin/python -m app.bot.bot
+Restart=always
+RestartSec=5
+Environment="PYTHONPATH=/opt/vpn_store"
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=append:/opt/vpn_store/logs/bot.log
+StandardError=append:/opt/vpn_store/logs/bot_error.log
+
+[Install]
+WantedBy=multi-user.target

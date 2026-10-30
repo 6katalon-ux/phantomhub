@@ -1,0 +1,7 @@
+{
+  "name": "VPN Store",
+  "description": "Production-grade VPN Subscription Management & Sales Platform with 3X-UI integration, Aiogram 3 Telegram Bot, and Mobile-First Web Admin Dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
