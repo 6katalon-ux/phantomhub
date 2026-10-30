@@ -21,20 +21,17 @@ class XUIClient:
 
     def _clean_url(self, raw_url: str) -> str:
         url = str(raw_url).strip().lstrip(".").rstrip("/")
+        # Automatically upgrade http:// to https:// for port 2053 or remote domains
+        if url.startswith("http://"):
+            if ":2053" in url or (not url.startswith("http://127.0.0.1") and not url.startswith("http://localhost")):
+                url = "https://" + url[7:]
+        elif not url.startswith("https://"):
+            url = f"https://{url}"
         return url
 
     def _get_candidate_urls(self) -> List[str]:
-        raw = self._clean_url(config.get("xui_url", "http://127.0.0.1:2053"))
-        candidates: List[str] = []
-        if raw.startswith("https://"):
-            candidates.append(raw)
-            # Never downgrade https:// to plain http:// when connecting to TLS ports
-        elif raw.startswith("http://"):
-            candidates.append(raw)
-            candidates.append("https://" + raw[7:])
-        else:
-            candidates.append(f"https://{raw}")
-            candidates.append(f"http://{raw}")
+        raw = self._clean_url(config.get("xui_url", "https://127.0.0.1:2053"))
+        candidates: List[str] = [raw]
         return candidates
 
     def _get_base_url(self) -> str:
