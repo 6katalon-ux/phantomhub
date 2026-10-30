@@ -27,13 +27,14 @@ if [ ! -d "$APP_DIR" ]; then
 fi
 
 cd "$APP_DIR"
-echo -e "${GREEN}[1/5] Checking Python Virtual Environment in ${APP_DIR}/.venv...${NC}"
+echo -e "${GREEN}[1/5] Ensuring all dependencies (including greenlet) are installed in .venv...${NC}"
 if [ ! -f "${APP_DIR}/.venv/bin/python" ]; then
-  echo -e "${YELLOW}Re-creating virtual environment...${NC}"
+  echo -e "${YELLOW}Creating virtual environment...${NC}"
   python3 -m venv "${APP_DIR}/.venv"
   "${APP_DIR}/.venv/bin/pip" install --upgrade pip
-  "${APP_DIR}/.venv/bin/pip" install -r requirements.txt
 fi
+"${APP_DIR}/.venv/bin/pip" install -r requirements.txt
+
 
 echo -e "${GREEN}[2/5] Testing FastAPI direct import...${NC}"
 "${APP_DIR}/.venv/bin/python" -c "from app.main import app; print('FastAPI imported cleanly!')"
