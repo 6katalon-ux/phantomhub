@@ -64,6 +64,8 @@ class VPNProvisioner:
             await session.commit()
             return False, None, f"Selected VPN server inbound (ID {inbound_id}) is not reachable on 3X-UI"
 
+        real_inbound_id = int(inbound.get("id") or inbound_id)
+
         # 5. Generate Client UUID and Unique Email
         client_uuid = str(uuid.uuid4())
         client_suffix = secrets.token_hex(3)
@@ -76,12 +78,13 @@ class VPNProvisioner:
         # 6. Add Client to 3X-UI
         protocol = inbound.get("protocol", "vless").lower()
         success_xui, xui_msg = await xui_client.add_client(
-            inbound_id=inbound_id,
+            inbound_id=real_inbound_id,
             client_uuid=client_uuid,
             email=client_email,
             total_gb=plan.traffic_gb,
             expire_time_ms=expire_time_ms,
-            max_ips=plan.max_ips or 2
+            max_ips=plan.max_ips or 2,
+            inbound=inbound
         )
 
         if not success_xui:
@@ -108,7 +111,7 @@ class VPNProvisioner:
             telegram_id=telegram_id,
             plan_id=plan.id,
             protocol=protocol,
-            inbound_id=inbound_id,
+            inbound_id=real_inbound_id,
             client_uuid=client_uuid,
             client_email=client_email,
             config_link=config_link,
@@ -149,18 +152,21 @@ class VPNProvisioner:
         if not inbound:
             return False, None, "Trial inbound server is not accessible in 3X-UI"
 
+        real_inbound_id = int(inbound.get("id") or inbound_id)
+
         client_uuid = str(uuid.uuid4())
         client_email = f"trial_{telegram_id}_{secrets.token_hex(2)}"
         expire_time_ms = int((time.time() + (duration_days * 86400)) * 1000)
         total_bytes = traffic_gb * 1024 * 1024 * 1024
 
         ok, msg = await xui_client.add_client(
-            inbound_id=inbound_id,
+            inbound_id=real_inbound_id,
             client_uuid=client_uuid,
             email=client_email,
             total_gb=traffic_gb,
             expire_time_ms=expire_time_ms,
-            max_ips=1
+            max_ips=1,
+            inbound=inbound
         )
         if not ok:
             return False, None, f"Failed to provision trial client: {msg}"
@@ -174,7 +180,7 @@ class VPNProvisioner:
             telegram_id=telegram_id,
             plan_id=None,
             protocol=inbound.get("protocol", "vless").lower(),
-            inbound_id=inbound_id,
+            inbound_id=real_inbound_id,
             client_uuid=client_uuid,
             client_email=client_email,
             config_link=config_link,

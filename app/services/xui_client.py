@@ -355,61 +355,133 @@ class XUIClient:
         total_gb: int,
         expire_time_ms: int,
         max_ips: int = 2,
-        flow: str = "xtls-rprx-vision"
+        flow: Optional[str] = None,
+        inbound: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, str]:
         """
         Add a client to a specific inbound in 3X-UI.
-        Handles both token-based and cookie-based authentication, and URL subpath variations.
+        Handles token & cookie authentication, dynamic URL discovery, and payload format variants.
         """
         session = await self._ensure_session()
-        base_url = self._get_base_url()
-        parsed = urllib.parse.urlsplit(base_url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
 
-        token = str(config.get("xui_token", "")).strip()
-        params = {"token": token} if token else {}
+        # 1. Resolve real inbound object to guarantee valid inbound ID and protocol
+        if not inbound:
+            inbound = await self.get_inbound(inbound_id)
+        if inbound and inbound.get("id"):
+            inbound_id = int(inbound["id"])
 
-        # 3X-UI expects client settings inside client object
-        client_settings = {
+        protocol = "vless"
+        security = "none"
+        network = "tcp"
+        if inbound:
+            protocol = str(inbound.get("protocol", "vless")).lower()
+            stream = {}
+            if isinstance(inbound.get("streamSettings"), str):
+                try:
+                    stream = json.loads(inbound["streamSettings"])
+                except Exception:
+                    stream = {}
+            elif isinstance(inbound.get("streamSettings"), dict):
+                stream = inbound["streamSettings"]
+            security = stream.get("security", "none")
+            network = stream.get("network", "tcp")
+
+        # 2. Determine flow based on protocol & reality/tls
+        effective_flow = ""
+        if flow is not None:
+            effective_flow = flow
+        elif protocol == "vless" and security in ("reality", "tls") and network == "tcp":
+            effective_flow = "xtls-rprx-vision"
+
+        # 3. Build client settings
+        total_bytes = int(total_gb * 1024 * 1024 * 1024) if total_gb > 0 else 0
+        client_settings: Dict[str, Any] = {
             "id": client_uuid,
             "email": email,
             "limitIp": max_ips,
-            "totalGB": total_gb * 1024 * 1024 * 1024, # Bytes
+            "totalGB": total_bytes,
             "expiryTime": expire_time_ms,
             "enable": True,
             "tgId": "",
-            "subId": client_uuid[:16],
-            "flow": flow
+            "subId": client_uuid.replace("-", "")[:16]
         }
+        if effective_flow:
+            client_settings["flow"] = effective_flow
+        if protocol == "vmess":
+            client_settings["alterId"] = 0
+        if protocol == "trojan":
+            client_settings["password"] = client_uuid
 
-        payload = {
+        token = str(config.get("xui_token", "")).strip()
+        params = {"token": token} if token else {}
+        headers = self._get_headers()
+
+        # 4. Gather candidate base URLs
+        candidate_bases = []
+        if self._active_base_url and self._active_base_url not in candidate_bases:
+            candidate_bases.append(self._active_base_url)
+        for c in self._get_candidate_urls():
+            if c not in candidate_bases:
+                candidate_bases.append(c)
+
+        urls_to_try = []
+        for b in candidate_bases:
+            b_clean = b.rstrip("/")
+            parsed = urllib.parse.urlsplit(b_clean)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            for p in ["/panel/api/inbounds/addClient", "/panel/inbound/addClient", "/xui/API/inbounds/addClient", "/xui/inbound/addClient"]:
+                u1 = f"{b_clean}{p}"
+                if u1 not in urls_to_try:
+                    urls_to_try.append(u1)
+                if parsed.path and parsed.path != "/":
+                    u2 = f"{origin}{p}"
+                    if u2 not in urls_to_try:
+                        urls_to_try.append(u2)
+
+        payload_json = {
             "id": int(inbound_id),
             "settings": json.dumps({"clients": [client_settings]})
         }
-
-        headers = self._get_headers()
-        urls_to_try = [f"{base_url}/panel/api/inbounds/addClient"]
-        if parsed.path and parsed.path != "/":
-            urls_to_try.append(f"{origin}/panel/api/inbounds/addClient")
+        payload_form = {
+            "id": str(inbound_id),
+            "settings": json.dumps({"clients": [client_settings]})
+        }
+        payload_nested = {
+            "id": int(inbound_id),
+            "settings": {"clients": [client_settings]}
+        }
 
         last_error = ""
         for target_url in urls_to_try:
-            try:
-                async with session.post(target_url, json=payload, headers=headers, params=params) as resp:
-                    text = await resp.text()
-                    try:
-                        data = json.loads(text)
-                        if data.get("success"):
-                            return True, "Client created successfully"
-                        last_error = data.get("msg", text[:150])
-                    except Exception:
+            # Try both JSON and Form encodings (different 3X-UI forks expect different Content-Types)
+            attempts = [
+                ("json_string", {"json": payload_json}),
+                ("form_data", {"data": payload_form}),
+                ("json_nested", {"json": payload_nested})
+            ]
+            for fmt_name, req_kwargs in attempts:
+                try:
+                    async with session.post(target_url, headers=headers, params=params, **req_kwargs) as resp:
+                        text = await resp.text()
+                        logger.info(f"3X-UI addClient to {target_url} ({fmt_name}): HTTP {resp.status}")
                         if resp.status == 200:
-                            return True, "Client created"
-                        last_error = f"HTTP {resp.status}: {text[:150]}"
-            except Exception as e:
-                last_error = f"Network error adding client: {str(e)}"
+                            try:
+                                data = json.loads(text)
+                                if data.get("success"):
+                                    self._active_base_url = target_url.split("/panel")[0].split("/xui")[0]
+                                    return True, "Client created successfully"
+                                last_error = data.get("msg", text[:120])
+                            except Exception:
+                                return True, "Client created"
+                        elif resp.status in (401, 403) and not token:
+                            # Session expired, re-login once
+                            await self.login()
+                        elif resp.status != 404:
+                            last_error = f"HTTP {resp.status}: {text[:100]}"
+                except Exception as e:
+                    last_error = f"Network error ({target_url}): {str(e)}"
 
-        return False, last_error or "Failed to add client to 3X-UI"
+        return False, last_error or "Failed to add client to 3X-UI (Inbound ID not found or endpoint unavailable)"
 
     async def update_client(
         self,
@@ -422,8 +494,9 @@ class XUIClient:
     ) -> Tuple[bool, str]:
         """Update client quota, expiration, or enable/disable state"""
         session = await self._ensure_session()
-        base_url = self._get_base_url()
-        url = f"{base_url}/panel/api/inbounds/updateClient/{client_uuid}"
+        token = str(config.get("xui_token", "")).strip()
+        params = {"token": token} if token else {}
+        headers = self._get_headers()
 
         client_settings = {
             "id": client_uuid,
@@ -433,36 +506,61 @@ class XUIClient:
             "enable": enable
         }
 
-        payload = {
-            "id": inbound_id,
+        candidate_bases = [self._active_base_url] if self._active_base_url else self._get_candidate_urls()
+        urls_to_try = []
+        for b in candidate_bases:
+            b_clean = b.rstrip("/")
+            urls_to_try.append(f"{b_clean}/panel/api/inbounds/updateClient/{client_uuid}")
+            urls_to_try.append(f"{b_clean}/panel/inbound/updateClient/{client_uuid}")
+
+        payload_json = {
+            "id": int(inbound_id),
             "settings": json.dumps({"clients": [client_settings]})
         }
-        headers = self._get_headers()
+        payload_form = {
+            "id": str(inbound_id),
+            "settings": json.dumps({"clients": [client_settings]})
+        }
 
-        try:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                data = await resp.json()
-                if data.get("success"):
-                    return True, "Client updated"
-                return False, data.get("msg", "Update failed")
-        except Exception as e:
-            return False, str(e)
+        for target_url in urls_to_try:
+            for req_kwargs in [{"json": payload_json}, {"data": payload_form}]:
+                try:
+                    async with session.post(target_url, headers=headers, params=params, **req_kwargs) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("success"):
+                                return True, "Client updated"
+                except Exception:
+                    pass
+
+        return False, "Update failed"
 
     async def delete_client(self, inbound_id: int, client_uuid: str) -> Tuple[bool, str]:
         """Delete client from 3X-UI"""
         session = await self._ensure_session()
-        base_url = self._get_base_url()
-        url = f"{base_url}/panel/api/inbounds/delClient/{inbound_id}/{client_uuid}"
+        token = str(config.get("xui_token", "")).strip()
+        params = {"token": token} if token else {}
         headers = self._get_headers()
 
-        try:
-            async with session.post(url, headers=headers) as resp:
-                data = await resp.json()
-                if data.get("success"):
-                    return True, "Client deleted from 3X-UI"
-                return False, data.get("msg", "Delete failed")
-        except Exception as e:
-            return False, str(e)
+        candidate_bases = [self._active_base_url] if self._active_base_url else self._get_candidate_urls()
+        urls_to_try = []
+        for b in candidate_bases:
+            b_clean = b.rstrip("/")
+            urls_to_try.append(f"{b_clean}/panel/api/inbounds/delClient/{inbound_id}/{client_uuid}")
+            urls_to_try.append(f"{b_clean}/panel/api/inbounds/delClient/{client_uuid}")
+            urls_to_try.append(f"{b_clean}/panel/inbound/delClient/{client_uuid}")
+
+        for target_url in urls_to_try:
+            try:
+                async with session.post(target_url, headers=headers, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("success"):
+                            return True, "Client deleted from 3X-UI"
+            except Exception:
+                pass
+
+        return False, "Delete failed"
 
     async def get_client_traffic(self, email: str) -> Optional[Dict[str, Any]]:
         """Retrieve upload, download, and total traffic for a client by email"""
@@ -488,7 +586,10 @@ class XUIClient:
         """
         protocol = inbound.get("protocol", "vless").lower()
         port = inbound.get("port", 443)
-        host = config.get("vpn_server_host", "127.0.0.1")
+        host = config.get("vpn_server_host", "").strip()
+        if not host or host in ("127.0.0.1", "localhost"):
+            parsed_xui = urllib.parse.urlsplit(self._get_base_url())
+            host = parsed_xui.hostname or "127.0.0.1"
         
         # Parse streamSettings and settings JSON
         stream = {}
@@ -511,9 +612,20 @@ class XUIClient:
             if security == "reality":
                 params["security"] = "reality"
                 reality_settings = stream.get("realitySettings", {})
+                if isinstance(reality_settings, str):
+                    try:
+                        reality_settings = json.loads(reality_settings)
+                    except Exception:
+                        reality_settings = {}
                 
                 # Extract real public key and shortIds from inbound
                 settings_data = reality_settings.get("settings", {})
+                if isinstance(settings_data, str):
+                    try:
+                        settings_data = json.loads(settings_data)
+                    except Exception:
+                        settings_data = {}
+
                 pbk = reality_settings.get("publicKey") or settings_data.get("publicKey", "")
                 
                 short_ids = reality_settings.get("shortIds") or settings_data.get("shortIds", [])
