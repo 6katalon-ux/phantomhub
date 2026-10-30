@@ -594,6 +594,49 @@ WantedBy=multi-user.target
     run_cmd("systemctl daemon-reload")
     success("Systemd services created: vpnstore-web, vpnstore-bot, vpnstore-worker")
 
+def step11b_configure_nginx(public_ip):
+    log("Configuring Nginx reverse proxy (Port 80 -> 8000)...", prefix="[Nginx]")
+    nginx_conf = """server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+"""
+    try:
+        with open("/etc/nginx/sites-available/vpnstore.conf", "w") as f:
+            f.write(nginx_conf)
+        
+        default_link = Path("/etc/nginx/sites-enabled/default")
+        if default_link.exists():
+            try:
+                default_link.unlink()
+            except Exception:
+                pass
+        
+        enabled_link = Path("/etc/nginx/sites-enabled/vpnstore.conf")
+        if not enabled_link.exists():
+            enabled_link.symlink_to("/etc/nginx/sites-available/vpnstore.conf")
+        
+        run_cmd("nginx -t", check=False)
+        run_cmd("systemctl restart nginx", check=False)
+        run_cmd("systemctl enable nginx", check=False)
+        success("Nginx reverse proxy active on Port 80 (Forwarding to 8000).")
+    except Exception as e:
+        warn(f"Nginx configuration skipped: {e}")
+
 def step12_configure_startup():
     log("Enabling services to start automatically on system boot...", prefix="[12/16]")
     run_cmd("systemctl enable vpnstore-web.service")
@@ -673,10 +716,11 @@ def main():
     step8_9_setup_database(base_dir, venv_dir, sec)
     admin_user, admin_pass = step10_create_admin_account(base_dir, venv_dir)
     step11_generate_systemd_services(base_dir, venv_dir)
+    pub_ip = get_public_ip()
+    step11b_configure_nginx(pub_ip)
     step12_configure_startup()
     step13_14_start_services()
     
-    pub_ip = get_public_ip()
     step15_configure_firewall(pub_ip)
     step16_display_summary(pub_ip, admin_user, admin_pass)
 

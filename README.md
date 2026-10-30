@@ -28,7 +28,7 @@
 
 ```bash
 # کلون کردن پروژه از گیت‌هاب:
-git clone https://github.com/YOUR_USERNAME/vpn-store.git /opt/vpn_store
+git clone https://github.com/6katalon-ux/phantomhub.git /opt/vpn_store
 cd /opt/vpn_store
 
 # اجرای نصاب خودکار:

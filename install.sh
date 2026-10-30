@@ -39,6 +39,8 @@ fi
 
 # Otherwise clone to /opt/vpn_store
 TARGET_DIR="/opt/vpn_store"
+REPO_URL="https://github.com/6katalon-ux/phantomhub.git"
+
 echo -e "${GREEN}[2/4] Preparing installation directory in ${TARGET_DIR}...${NC}"
 mkdir -p "$TARGET_DIR"
 
@@ -47,7 +49,8 @@ if [ -d "$TARGET_DIR/.git" ]; then
     cd "$TARGET_DIR"
     git pull || true
 else
-    echo -e "${CYAN}Running setup directly in ${TARGET_DIR}...${NC}"
+    echo -e "${CYAN}Cloning from ${REPO_URL}...${NC}"
+    git clone "$REPO_URL" "$TARGET_DIR"
 fi
 
 cd "$TARGET_DIR"
