@@ -46,6 +46,66 @@ class ApiService {
   private fallbackGiftCodes: GiftCodeItem[] = loadFromStorage('gift_codes', INITIAL_GIFT_CODES);
   private fallbackTransactions: TransactionItem[] = loadFromStorage('transactions', INITIAL_TRANSACTIONS);
 
+  private authListeners: (() => void)[] = [];
+
+  addAuthListener(listener: () => void) {
+    this.authListeners.push(listener);
+    return () => {
+      this.authListeners = this.authListeners.filter(l => l !== listener);
+    };
+  }
+
+  private notifyAuthError() {
+    this.authListeners.forEach(listener => {
+      try {
+        listener();
+      } catch (e) {
+        console.error('Error in auth listener:', e);
+      }
+    });
+  }
+
+  // --- Authentication ---
+  async login(username: string, password: string): Promise<{ token: string; admin: any }> {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ username, password })
+    });
+
+    if (!res.ok) {
+      let errText = 'خطا در احراز هویت';
+      try {
+        const data = await res.json();
+        errText = data.detail || data.message || errText;
+      } catch {}
+      throw new Error(errText);
+    }
+
+    const data = await res.json();
+    if (data.token) {
+      localStorage.setItem('vpnstore_token', data.token);
+    }
+    return data;
+  }
+
+  async logout(): Promise<void> {
+    try {
+      await this.request('/api/auth/logout', { method: 'POST' });
+    } catch {}
+    localStorage.removeItem('vpnstore_token');
+    this.notifyAuthError();
+  }
+
+  async getMe(): Promise<any> {
+    return await this.request('/api/auth/me');
+  }
+
+  hasToken(): boolean {
+    return Boolean(localStorage.getItem('vpnstore_token'));
+  }
+
   // --- Helper for authenticated fetch ---
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const headers = {
@@ -54,6 +114,10 @@ class ApiService {
     };
     const res = await fetch(path, { credentials: 'include', ...options, headers });
     if (!res.ok) {
+      if (res.status === 401) {
+        localStorage.removeItem('vpnstore_token');
+        this.notifyAuthError();
+      }
       let errorMsg = `HTTP ${res.status}`;
       try {
         const errJson = await res.json();

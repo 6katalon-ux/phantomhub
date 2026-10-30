@@ -9,6 +9,17 @@ interface InboundsTabProps {
 }
 
 export const InboundsTab: React.FC<InboundsTabProps> = ({ inbounds, onRefresh, isRtl }) => {
+  const [refreshing, setRefreshing] = React.useState(false);
+
+  const handleRefreshClick = async () => {
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-neutral-800">
@@ -25,11 +36,12 @@ export const InboundsTab: React.FC<InboundsTabProps> = ({ inbounds, onRefresh, i
         </div>
 
         <button
-          onClick={onRefresh}
+          onClick={handleRefreshClick}
+          disabled={refreshing}
           className="flex items-center gap-2 py-2 px-4 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-semibold rounded-xl transition-all border border-neutral-700/60"
         >
-          <RefreshCw className="w-3.5 h-3.5 text-cyan-400" />
-          <span>{isRtl ? 'بروزرسانی اینباندها' : 'Refresh Inbounds'}</span>
+          <RefreshCw className={`w-3.5 h-3.5 text-cyan-400 ${refreshing ? 'animate-spin' : ''}`} />
+          <span>{refreshing ? (isRtl ? 'در حال دریافت...' : 'Refreshing...') : (isRtl ? 'بروزرسانی اینباندها' : 'Refresh Inbounds')}</span>
         </button>
       </div>
 

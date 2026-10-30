@@ -13,6 +13,7 @@ import { Sidebar } from './components/Sidebar';
 import { ToastContainer, ToastMessage } from './components/Toast';
 import { ConfirmModal } from './components/ConfirmModal';
 import { QRCodeModal } from './components/QRCodeModal';
+import { LoginScreen } from './components/LoginScreen';
 
 // Tabs
 import { DashboardTab } from './components/tabs/DashboardTab';
@@ -33,6 +34,8 @@ import { LogsTab } from './components/tabs/LogsTab';
 
 export default function App() {
   const [lang, setLang] = useState<Language>('fa');
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(api.hasToken());
+  const [currentAdmin, setCurrentAdmin] = useState<any>(null);
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -117,8 +120,40 @@ export default function App() {
   };
 
   useEffect(() => {
-    loadAllData();
+    const unbind = api.addAuthListener(() => {
+      setIsAuthenticated(false);
+      setCurrentAdmin(null);
+    });
+
+    if (api.hasToken()) {
+      api.getMe()
+        .then(admin => {
+          setIsAuthenticated(true);
+          setCurrentAdmin(admin);
+          loadAllData();
+        })
+        .catch(() => {
+          setIsAuthenticated(false);
+          setCurrentAdmin(null);
+        });
+    }
+
+    return () => unbind();
   }, []);
+
+  const handleLoginSuccess = (admin: any) => {
+    setIsAuthenticated(true);
+    setCurrentAdmin(admin);
+    loadAllData();
+    addToast('success', isRtl ? 'با موفقیت وارد شدید' : 'Logged in successfully');
+  };
+
+  const handleLogout = async () => {
+    await api.logout();
+    setIsAuthenticated(false);
+    setCurrentAdmin(null);
+    addToast('info', isRtl ? 'از حساب مدیریت خارج شدید' : 'Logged out');
+  };
 
   // Update HTML dir and lang
   useEffect(() => {
@@ -262,16 +297,37 @@ export default function App() {
     addToast('success', isRtl ? 'اعلان به صف ارسال به کاربران تلگرام اضافه شد' : 'Broadcast queued for Telegram delivery');
   };
 
+  const handleRefreshInbounds = async () => {
+    try {
+      const list = await api.getInbounds();
+      setInbounds(list);
+      addToast('success', isRtl ? `اینباندها با موفقیت بروزرسانی شدند (${list.length} اینباند)` : `Inbounds updated (${list.length} found)`);
+    } catch {
+      addToast('error', isRtl ? 'خطا در ارتباط با 3X-UI یا دریافت اینباندها' : 'Failed to fetch inbounds from 3X-UI');
+    }
+  };
+
   const handleTriggerBackup = async () => {
     const filename = await api.triggerBackup();
     addToast('success', isRtl ? `فایل بکاپ ایجاد گردید: ${filename}` : `Backup created: ${filename}`);
     return filename;
   };
 
+  if (!isAuthenticated) {
+    return (
+      <LoginScreen
+        onLoginSuccess={handleLoginSuccess}
+        lang={lang}
+        onToggleLang={handleToggleLang}
+      />
+    );
+  }
+
   if (!settings) {
     return (
-      <div className="min-h-screen bg-neutral-950 flex items-center justify-center text-neutral-400 text-xs">
-        {isRtl ? 'در حال بارگذاری پنل مدیریت VPN Store...' : 'Loading VPN Store Admin Panel...'}
+      <div className="min-h-screen bg-neutral-950 flex flex-col items-center justify-center text-neutral-400 text-xs gap-3">
+        <div className="w-6 h-6 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin" />
+        <span>{isRtl ? 'در حال بارگذاری اطلاعات پنل مدیریت...' : 'Loading VPN Store Admin Panel...'}</span>
       </div>
     );
   }
@@ -286,6 +342,8 @@ export default function App() {
         isSyncing={isSyncing}
         onSyncTraffic={handleSyncTraffic}
         isRtl={isRtl}
+        adminUser={currentAdmin}
+        onLogout={handleLogout}
       />
 
       <div className="flex-1 flex max-w-7xl w-full mx-auto">
@@ -334,7 +392,7 @@ export default function App() {
           {activeTab === 'inbounds' && (
             <InboundsTab
               inbounds={inbounds}
-              onRefresh={loadAllData}
+              onRefresh={handleRefreshInbounds}
               isRtl={isRtl}
             />
           )}
