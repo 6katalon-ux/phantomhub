@@ -531,13 +531,13 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory={base_dir}
-ExecStart={py_bin} -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+ExecStart={py_bin} -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=3
 Environment="PYTHONPATH={base_dir}"
 Environment="PYTHONUNBUFFERED=1"
-StandardOutput=append:{base_dir}/logs/web.log
-StandardError=append:{base_dir}/logs/web_error.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -559,8 +559,8 @@ Restart=always
 RestartSec=5
 Environment="PYTHONPATH={base_dir}"
 Environment="PYTHONUNBUFFERED=1"
-StandardOutput=append:{base_dir}/logs/bot.log
-StandardError=append:{base_dir}/logs/bot_error.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -582,8 +582,8 @@ Restart=always
 RestartSec=10
 Environment="PYTHONPATH={base_dir}"
 Environment="PYTHONUNBUFFERED=1"
-StandardOutput=append:{base_dir}/logs/worker.log
-StandardError=append:{base_dir}/logs/worker_error.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

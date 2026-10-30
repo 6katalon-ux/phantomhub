@@ -11,8 +11,8 @@ Restart=always
 RestartSec=5
 Environment="PYTHONPATH=/opt/vpn_store"
 Environment="PYTHONUNBUFFERED=1"
-StandardOutput=append:/opt/vpn_store/logs/bot.log
-StandardError=append:/opt/vpn_store/logs/bot_error.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

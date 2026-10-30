@@ -6,13 +6,13 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/vpn_store
-ExecStart=/opt/vpn_store/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+ExecStart=/opt/vpn_store/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=3
 Environment="PYTHONPATH=/opt/vpn_store"
 Environment="PYTHONUNBUFFERED=1"
-StandardOutput=append:/opt/vpn_store/logs/web.log
-StandardError=append:/opt/vpn_store/logs/web_error.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
