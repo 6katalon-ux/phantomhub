@@ -358,7 +358,8 @@ class XUIClient:
         expire_time_ms: int,
         max_ips: int = 2,
         flow: Optional[str] = None,
-        inbound: Optional[Dict[str, Any]] = None
+        inbound: Optional[Dict[str, Any]] = None,
+        telegram_id: Optional[int] = None
     ) -> Tuple[bool, str]:
         """
         Add a client to a specific inbound in 3X-UI.
@@ -397,6 +398,13 @@ class XUIClient:
 
         # 3. Build client settings
         total_bytes = int(total_gb * 1024 * 1024 * 1024) if total_gb > 0 else 0
+        client_tg_id = 0
+        if telegram_id:
+            try:
+                client_tg_id = int(telegram_id)
+            except Exception:
+                client_tg_id = 0
+
         client_settings: Dict[str, Any] = {
             "id": client_uuid,
             "email": email,
@@ -404,7 +412,7 @@ class XUIClient:
             "totalGB": total_bytes,
             "expiryTime": expire_time_ms,
             "enable": True,
-            "tgId": "",
+            "tgId": client_tg_id,
             "subId": client_uuid.replace("-", "")[:16]
         }
         if effective_flow:

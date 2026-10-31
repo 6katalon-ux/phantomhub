@@ -84,7 +84,8 @@ class VPNProvisioner:
             total_gb=plan.traffic_gb,
             expire_time_ms=expire_time_ms,
             max_ips=plan.max_ips or 2,
-            inbound=inbound
+            inbound=inbound,
+            telegram_id=telegram_id
         )
 
         if not success_xui:
@@ -166,7 +167,8 @@ class VPNProvisioner:
             total_gb=traffic_gb,
             expire_time_ms=expire_time_ms,
             max_ips=1,
-            inbound=inbound
+            inbound=inbound,
+            telegram_id=telegram_id
         )
         if not ok:
             return False, None, f"Failed to provision trial client: {msg}"
