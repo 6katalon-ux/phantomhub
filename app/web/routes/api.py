@@ -31,7 +31,9 @@ from app.services.xui_client import xui_client
 from app.services.vpn_provisioner import vpn_provisioner
 from app.services.wallet import wallet_service
 from app.services.traffic_sync import traffic_sync_service
+from app.services.telegram_notify import send_telegram_notification
 from app.workers.scheduler import perform_db_backup, BACKUPS_DIR
+
 
 api_router = APIRouter()
 
@@ -418,7 +420,22 @@ async def adjust_user_balance(
     await db.commit()
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
+
+    # Send notification to user
+    res_u = await db.execute(select(User).where(User.id == user_id))
+    user = res_u.scalar_one_or_none()
+    if user and user.telegram_id:
+        currency = config.get("currency", "تومان")
+        diff_str = f"+{req.amount:,}" if req.amount >= 0 else f"{req.amount:,}"
+        notif_text = (
+            f"🔔 *تغییر موجودی کیف پول*\n\n"
+            f"کاربر گرامی، موجودی کیف پول شما توسط مدیریت به میزان *{diff_str} {currency}* تغییر یافت.\n"
+            f"💵 موجودی فعلی: *{new_bal:,} {currency}*"
+        )
+        await send_telegram_notification(user.telegram_id, notif_text)
+
     return {"message": msg, "new_balance": new_bal}
+
 
 @api_router.post("/users/{user_id}/toggle-block")
 async def toggle_block_user(user_id: int, admin: Dict[str, Any] = Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
@@ -494,23 +511,51 @@ async def review_payment(payment_id: int, req: PaymentReviewRequest, admin: Dict
         raise HTTPException(status_code=400, detail="Payment has already been processed")
 
     payment.reviewed_at = datetime.utcnow()
-    payment.admin_note = req.admin_note
+    admin_name = admin.get("username", "admin")
+    payment.admin_note = req.admin_note or f"Reviewed via Web Panel by {admin_name}"
+    currency = config.get("currency", "تومان")
+
+    # Fetch user for instant Telegram notification
+    res_u = await db.execute(select(User).where(User.id == payment.user_id))
+    user = res_u.scalar_one_or_none()
 
     if req.action == "approve":
         payment.status = "approved"
         # Atomically credit user's wallet
-        await wallet_service.add_funds(
+        ok, new_bal, msg = await wallet_service.add_funds(
             session=db,
             user_id=payment.user_id,
             amount=payment.amount,
             tx_type="topup",
-            description=f"Approved payment #{payment.id}"
+            description=f"Approved payment #{payment.id} by {admin_name}"
         )
+        await db.commit()
+
+        # Send instant notification to customer via Telegram
+        if user and user.telegram_id:
+            user_msg = (
+                f"🎉 *کیف پول شما با موفقیت شارژ شد!*\n\n"
+                f"✅ شناسه فیش: `#{payment.id}`\n"
+                f"💰 مبلغ افزوده شده: *{payment.amount:,} {currency}*\n"
+                f"💵 موجودی فعلی: *{new_bal:,} {currency}*\n\n"
+                f"هم‌اکنون می‌توانید از منوی ربات تلگرام اقدام به خرید یا تمدید اشتراک فرمایید."
+            )
+            await send_telegram_notification(user.telegram_id, user_msg)
     else:
         payment.status = "rejected"
+        await db.commit()
 
-    await db.commit()
+        # Send rejection notification to customer via Telegram
+        if user and user.telegram_id:
+            user_msg = (
+                f"❌ *عدم تایید فیش واریزی*\n\n"
+                f"کاربر گرامی، فیش واریزی شما با شناسه `#{payment.id}` به مبلغ *{payment.amount:,} {currency}* توسط مدیریت تایید نشد.\n\n"
+                f"در صورت نیاز به بررسی یا بروز مشکل، لطفاً با پشتیبانی در ارتباط باشید."
+            )
+            await send_telegram_notification(user.telegram_id, user_msg)
+
     return {"message": f"Payment #{payment.id} {payment.status}"}
+
 
 # --- 9. Gift Codes ---
 @api_router.get("/gift-codes")

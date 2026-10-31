@@ -65,5 +65,38 @@ def service_actions_keyboard(service_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def cancel_keyboard() -> InlineKeyboardMarkup:
-    kb = [[InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_action")]]
+    kb = [[InlineKeyboardButton(text="❌ لغو و بازگشت", callback_data="cancel_action")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def wallet_topup_keyboard() -> InlineKeyboardMarkup:
+    """Quick amount selection keyboard for wallet deposit"""
+    kb = [
+        [
+            InlineKeyboardButton(text="۵۰,۰۰۰ تومان", callback_data="topup_amt_50000"),
+            InlineKeyboardButton(text="۱۰۰,۰۰۰ تومان", callback_data="topup_amt_100000")
+        ],
+        [
+            InlineKeyboardButton(text="۲۰۰,۰۰۰ تومان", callback_data="topup_amt_200000"),
+            InlineKeyboardButton(text="۵۰۰,۰۰۰ تومان", callback_data="topup_amt_500000")
+        ],
+        [
+            InlineKeyboardButton(text="✏️ مبلغ دلخواه", callback_data="topup_amt_custom")
+        ],
+        [
+            InlineKeyboardButton(text="❌ لغو و بازگشت", callback_data="cancel_action")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def admin_payment_review_keyboard(payment_id: int, amount: int) -> InlineKeyboardMarkup:
+    """Inline keyboard sent to admin Telegram to approve/reject payment receipts"""
+    kb = [
+        [
+            InlineKeyboardButton(text=f"✅ تایید و شارژ ({amount:,} تومان)", callback_data=f"adm_pay_app_{payment_id}")
+        ],
+        [
+            InlineKeyboardButton(text="❌ رد فیش واریزی", callback_data=f"adm_pay_rej_{payment_id}")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+

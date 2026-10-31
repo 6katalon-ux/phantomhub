@@ -17,19 +17,46 @@ import math
 from app.models.models import User, Plan, Service, Payment, GiftCode, GiftRedemption
 from app.core.database import AsyncSessionLocal
 from app.core.config import config
+from typing import Optional
 from app.services.vpn_provisioner import vpn_provisioner
 from app.services.wallet import wallet_service
 from app.bot.keyboards import (
     main_menu_keyboard, plans_keyboard, plan_confirm_keyboard,
-    service_actions_keyboard, cancel_keyboard
+    service_actions_keyboard, cancel_keyboard,
+    wallet_topup_keyboard, admin_payment_review_keyboard
 )
+from app.services.telegram_notify import get_admin_telegram_ids, send_telegram_notification
 from app.core.logging import logger
 
 router = Router()
 
 class FormStates(StatesGroup):
+    waiting_for_custom_amount = State()
     waiting_for_payment_receipt = State()
     waiting_for_gift_code = State()
+
+def parse_persian_number(val: str) -> Optional[int]:
+    """Extract and parse numbers with support for Persian and Arabic digits"""
+    if not val:
+        return None
+    persian_to_eng = {
+        '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4',
+        '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
+        '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4',
+        '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
+    }
+    cleaned = str(val).replace(',', '').replace('،', '').replace('.', '').replace(' ', '')
+    for k, v in persian_to_eng.items():
+        cleaned = cleaned.replace(k, v)
+    import re
+    nums = re.findall(r'\d+', cleaned)
+    if nums:
+        try:
+            return int(nums[0])
+        except Exception:
+            return None
+    return None
+
 
 async def get_or_create_user(session: AsyncSession, msg: Message) -> User:
     """Ensure user is registered in SQLite with latest profile details"""
@@ -254,54 +281,309 @@ async def handle_my_services(message: Message):
 # --- 5. Payment & Wallet Top-up ---
 @router.message(F.text.contains("کارت به کارت") | F.text.contains("افزایش موجودی") | F.text.contains("Payment") | F.text.contains("Wallet"))
 async def handle_payment_menu(message: Message, state: FSMContext):
+    await state.clear()
     card_number = config.get("card_number", "6037-9975-0000-0000")
-    card_holder = config.get("card_holder", "صاحب کارت")
+    card_holder = config.get("card_holder", "صاحب حساب")
     crypto_wallet = config.get("crypto_wallet", "")
-    instructions = config.get("payment_instructions", "لطفاً مبلغ مورد نظر را واریز کرده و مشخصات واریزی را ارسال کنید.")
+    instructions = config.get("payment_instructions", "")
     currency = config.get("currency", "تومان")
 
-    text = f"💳 *راهنمای افزایش موجودی و پرداخت*\n\n"
-    text += f"💳 شماره کارت بانکی:\n`{card_number}`\n"
-    text += f"👤 به نام: *{card_holder}*\n\n"
-    if crypto_wallet:
-        text += f"🪙 آدرس ولت تتر یا رمزارز:\n`{crypto_wallet}`\n\n"
-    text += f"📝 *توضیحات:*\n{instructions}\n\n"
-    text += f"⚠️ *مرحله بعد:* لطفاً مبلغ واریزی (به {currency}) و شماره پیگیری یا عکس فیش را همینجا ارسال فرمایید."
+    async with AsyncSessionLocal() as session:
+        user = await get_or_create_user(session, message)
+        user_balance = user.wallet_balance
 
-    await message.answer(text, parse_mode="Markdown", reply_markup=cancel_keyboard())
+    text = f"💰 *مدیریت کیف پول و افزایش موجودی*\n\n"
+    text += f"👤 کاربر: *{message.from_user.first_name or ''}*\n"
+    text += f"💵 موجودی فعلی: *{user_balance:,} {currency}*\n\n"
+    text += f"💳 *شماره کارت بانکی (لمس جهت کپی):*\n`{card_number}`\n"
+    text += f"👤 *به نام:* {card_holder}\n\n"
+    if crypto_wallet:
+        text += f"🪙 *آدرس کیف پول تتر / کریپتو:*\n`{crypto_wallet}`\n\n"
+    if instructions:
+        text += f"ℹ️ *توضیحات:* {instructions}\n\n"
+    text += f"👇 لطفاً یکی از مبالغ زیر را جهت افزایش موجودی انتخاب فرمایید، یا گزینه *مبلغ دلخواه* را لمس کنید:"
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=wallet_topup_keyboard())
+
+@router.callback_query(F.data.startswith("topup_amt_"))
+async def handle_topup_amount_selection(callback: CallbackQuery, state: FSMContext):
+    card_number = config.get("card_number", "6037-9975-0000-0000")
+    card_holder = config.get("card_holder", "صاحب حساب")
+    currency = config.get("currency", "تومان")
+
+    if callback.data == "topup_amt_custom":
+        await state.set_state(FormStates.waiting_for_custom_amount)
+        text = (
+            f"✏️ *ورود مبلغ دلخواه*\n\n"
+            f"لطفاً مبلغ مورد نظر خود را به *{currency}* ارسال فرمایید:\n"
+            f"💡 _حداقل مبلغ قابل افزایش: ۱۰,۰۰۰ {currency}_"
+        )
+        try:
+            await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=cancel_keyboard())
+        except Exception:
+            await callback.message.answer(text, parse_mode="Markdown", reply_markup=cancel_keyboard())
+        await callback.answer()
+        return
+
+    amount_str = callback.data.replace("topup_amt_", "")
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        await callback.answer("خطا در انتخاب مبلغ", show_alert=True)
+        return
+
+    await state.update_data(topup_amount=amount)
     await state.set_state(FormStates.waiting_for_payment_receipt)
+
+    text = (
+        f"💳 *افزایش موجودی به مبلغ: {amount:,} {currency}*\n\n"
+        f"لطفاً مبلغ فوق را به شماره کارت زیر انتقال دهید:\n\n"
+        f"💳 *شماره کارت (لمس جهت کپی):*\n`{card_number}`\n"
+        f"👤 *به نام:* {card_holder}\n\n"
+        f"📸 *مرحله بعد:* پس از واریز وجه، لطفاً *تصویر فیش واریزی* (یا شماره پیگیری) را همینجا ارسال فرمایید."
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=cancel_keyboard())
+    except Exception:
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=cancel_keyboard())
+    await callback.answer()
+
+@router.message(FormStates.waiting_for_custom_amount)
+async def process_custom_amount(message: Message, state: FSMContext):
+    currency = config.get("currency", "تومان")
+    amount = parse_persian_number(message.text or "")
+    if not amount or amount < 10000:
+        await message.answer(
+            f"⚠️ *مبلغ وارد شده معتبر نیست!*\n\n"
+            f"لطفاً مبلغی حداقل معادل *۱۰,۰۰۰ {currency}* به صورت عدد وارد فرمایید.\n"
+            f"مثال: `150000`\n"
+            f"برای انصراف دکمه زیر را لمس کنید.",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
+        )
+        return
+
+    await state.update_data(topup_amount=amount)
+    await state.set_state(FormStates.waiting_for_payment_receipt)
+
+    card_number = config.get("card_number", "6037-9975-0000-0000")
+    card_holder = config.get("card_holder", "صاحب حساب")
+
+    text = (
+        f"💳 *افزایش موجودی به مبلغ: {amount:,} {currency}*\n\n"
+        f"لطفاً مبلغ فوق را به کارت زیر واریز فرمایید:\n\n"
+        f"💳 *شماره کارت (لمس جهت کپی):*\n`{card_number}`\n"
+        f"👤 *به نام:* {card_holder}\n\n"
+        f"📸 *مرحله بعد:* پس از واریز وجه، لطفاً *تصویر فیش واریزی* (یا متن شماره پیگیری) را همینجا ارسال فرمایید."
+    )
+    await message.answer(text, parse_mode="Markdown", reply_markup=cancel_keyboard())
 
 @router.message(FormStates.waiting_for_payment_receipt)
 async def process_payment_receipt(message: Message, state: FSMContext):
-    content = message.text or message.caption or "فیش ارسالی تصویری"
+    data = await state.get_data()
+    amount = data.get("topup_amount")
+    currency = config.get("currency", "تومان")
+
+    # If amount was missing from state, try extracting from text/caption
+    if not amount:
+        content_text = message.text or message.caption or ""
+        parsed = parse_persian_number(content_text)
+        if parsed and parsed >= 10000:
+            amount = parsed
+        else:
+            await message.answer(
+                f"⚠️ *مبلغ واریزی مشخص نیست!*\n\n"
+                f"لطفاً ابتدا مبلغ افزایش موجودی را تعیین فرمایید:",
+                parse_mode="Markdown",
+                reply_markup=wallet_topup_keyboard()
+            )
+            await state.clear()
+            return
+
+    # Check for photo or document
+    photo_file_id = None
+    if message.photo:
+        photo_file_id = message.photo[-1].file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        photo_file_id = message.document.file_id
+
+    receipt_note = message.caption or message.text or ""
+    if photo_file_id:
+        full_note = f"[تصویر فیش] {receipt_note}".strip()
+    else:
+        full_note = receipt_note.strip()
+        if len(full_note) < 3:
+            await message.answer(
+                "⚠️ لطفاً تصویر فیش واریزی یا شماره پیگیری معتبر ارسال فرمایید.",
+                reply_markup=cancel_keyboard()
+            )
+            return
+
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
-        
-        # Extract numbers if present, otherwise default to 0
-        import re
-        nums = re.findall(r'\d+', content.replace(',', ''))
-        amount = int(nums[0]) if nums else 100000
 
         payment = Payment(
             user_id=user.id,
             amount=amount,
             method="card",
             reference_id=str(message.message_id),
-            receipt_note=content,
+            receipt_note=full_note,
             status="pending"
         )
         session.add(payment)
         await session.commit()
+        await session.refresh(payment)
 
-        currency = config.get("currency", "تومان")
+        # Acknowledge to customer
         await message.answer(
-            f"✅ *اطلاعات پرداخت شما ثبت گردید.*\n"
-            f"شناسه پیگیری فیش: `{payment.id}`\n\n"
-            f"همکاران ما در پنل مدیریت صحت واریزی را بررسی کرده و به زودی کیف پول شما را شارژ خواهند نمود.",
+            f"✅ *اطلاعات فیش واریزی با موفقیت ثبت شد.*\n\n"
+            f"🧾 شناسه پیگیری فیش: `#{payment.id}`\n"
+            f"💰 مبلغ واریزی: *{payment.amount:,} {currency}*\n"
+            f"⏳ وضعیت: *در انتظار بررسی و تایید مدیریت*\n\n"
+            f"💡 به محض تایید توسط مدیریت، کیف پول شما به صورت آنی شارژ شده و پیام تایید برای شما ارسال خواهد شد.",
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard()
         )
+
+        # Notify Telegram Admin(s) with inline review keyboard!
+        admin_ids = get_admin_telegram_ids()
+        admin_text = (
+            f"🔔 *درخواست جدید افزایش موجودی (کارت‌به‌کارت)*\n\n"
+            f"🧾 شناسه پرداخت: `#{payment.id}`\n"
+            f"👤 کاربر: *{user.first_name or ''} {user.last_name or ''}*\n"
+            f"🏷️ نام کاربری: @{user.username or 'ندارد'}\n"
+            f"🆔 شناسه عددی: `{user.telegram_id}`\n"
+            f"💰 مبلغ درخواستی: *{payment.amount:,} {currency}*\n"
+            f"📝 متن/پیگیری: {receipt_note or 'فیش تصویری بدون متن'}\n"
+            f"📅 تاریخ: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+        review_kb = admin_payment_review_keyboard(payment.id, payment.amount)
+
+        for adm_id in admin_ids:
+            try:
+                if photo_file_id:
+                    await message.bot.send_photo(
+                        chat_id=adm_id,
+                        photo=photo_file_id,
+                        caption=admin_text,
+                        parse_mode="Markdown",
+                        reply_markup=review_kb
+                    )
+                else:
+                    await message.bot.send_message(
+                        chat_id=adm_id,
+                        text=admin_text,
+                        parse_mode="Markdown",
+                        reply_markup=review_kb
+                    )
+            except Exception as e:
+                logger.error(f"Failed to forward payment #{payment.id} to admin {adm_id}: {e}")
+
     await state.clear()
+
+# --- Admin Payment Inline Review Handlers ---
+@router.callback_query(F.data.startswith("adm_pay_app_") | F.data.startswith("adm_pay_rej_"))
+async def handle_admin_payment_action(callback: CallbackQuery):
+    admin_ids = get_admin_telegram_ids()
+    if admin_ids and callback.from_user.id not in admin_ids:
+        await callback.answer("⛔ شما به عنوان ادمین مجاز در سیستم ثبت نشده‌اید.", show_alert=True)
+        return
+
+    is_approve = callback.data.startswith("adm_pay_app_")
+    prefix = "adm_pay_app_" if is_approve else "adm_pay_rej_"
+    try:
+        payment_id = int(callback.data.replace(prefix, ""))
+    except ValueError:
+        await callback.answer("شناسه پرداخت نامعتبر است", show_alert=True)
+        return
+
+    currency = config.get("currency", "تومان")
+    admin_tag = f"@{callback.from_user.username}" if callback.from_user.username else (callback.from_user.first_name or str(callback.from_user.id))
+
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(Payment).where(Payment.id == payment_id))
+        payment = res.scalar_one_or_none()
+
+        if not payment:
+            await callback.answer("پرداخت یافت نشد", show_alert=True)
+            return
+
+        if payment.status != "pending":
+            await callback.answer(f"این پرداخت قبلاً پردازش شده است ({payment.status})", show_alert=True)
+            status_tag = f"\n\n⚠️ *این فیش قبلاً تعیین وضعیت شده است: {payment.status}*"
+            try:
+                if callback.message.caption:
+                    await callback.message.edit_caption(caption=f"{callback.message.caption}{status_tag}", reply_markup=None)
+                else:
+                    await callback.message.edit_text(text=f"{callback.message.text}{status_tag}", reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        res_u = await session.execute(select(User).where(User.id == payment.user_id))
+        user = res_u.scalar_one_or_none()
+
+        if is_approve:
+            payment.status = "approved"
+            payment.reviewed_at = datetime.utcnow()
+            payment.admin_note = f"Approved in Telegram by {admin_tag}"
+            ok, new_bal, msg = await wallet_service.add_funds(
+                session=session,
+                user_id=payment.user_id,
+                amount=payment.amount,
+                tx_type="topup",
+                description=f"Telegram approved payment #{payment.id}"
+            )
+            await session.commit()
+
+            status_text = f"\n\n✅ *تایید شد:* مبلغ *{payment.amount:,} {currency}* توسط {admin_tag} تایید و به کیف پول کاربر اضافه گردید."
+            try:
+                if callback.message.caption:
+                    await callback.message.edit_caption(caption=f"{callback.message.caption}{status_text}", parse_mode="Markdown", reply_markup=None)
+                else:
+                    await callback.message.edit_text(text=f"{callback.message.text}{status_text}", parse_mode="Markdown", reply_markup=None)
+            except Exception:
+                pass
+
+            await callback.answer(f"✅ فیش تایید شد و {payment.amount:,} {currency} شارژ شد.", show_alert=True)
+
+            # Send instant notification to customer!
+            if user and user.telegram_id:
+                user_msg = (
+                    f"🎉 *کیف پول شما با موفقیت شارژ شد!*\n\n"
+                    f"✅ شناسه پرداخت: `#{payment.id}`\n"
+                    f"💰 مبلغ افزوده شده: *{payment.amount:,} {currency}*\n"
+                    f"💵 موجودی فعلی کیف پول: *{new_bal:,} {currency}*\n\n"
+                    f"هم‌اکنون می‌توانید از طریق منوی اصلی اقدام به خرید یا تمدید اشتراک نمایید. 👇"
+                )
+                await send_telegram_notification(user.telegram_id, user_msg)
+
+        else: # Reject
+            payment.status = "rejected"
+            payment.reviewed_at = datetime.utcnow()
+            payment.admin_note = f"Rejected in Telegram by {admin_tag}"
+            await session.commit()
+
+            status_text = f"\n\n❌ *رد شد:* این فیش توسط {admin_tag} رد شد."
+            try:
+                if callback.message.caption:
+                    await callback.message.edit_caption(caption=f"{callback.message.caption}{status_text}", parse_mode="Markdown", reply_markup=None)
+                else:
+                    await callback.message.edit_text(text=f"{callback.message.text}{status_text}", parse_mode="Markdown", reply_markup=None)
+            except Exception:
+                pass
+
+            await callback.answer("❌ فیش واریزی رد گردید.", show_alert=True)
+
+            # Send rejection notification to customer!
+            if user and user.telegram_id:
+                user_msg = (
+                    f"❌ *عدم تایید فیش واریزی*\n\n"
+                    f"کاربر گرامی، فیش واریزی شما با شناسه `#{payment.id}` به مبلغ *{payment.amount:,} {currency}* توسط مدیریت تایید نشد.\n\n"
+                    f"در صورت نیاز به بررسی یا بروز مشکل، لطفاً با پشتیبانی در ارتباط باشید."
+                )
+                await send_telegram_notification(user.telegram_id, user_msg)
+
 
 # --- 6. Gift Code ---
 @router.message(F.text.contains("کد هدیه") | F.text.contains("Gift Code"))
