@@ -579,10 +579,39 @@ class XUIClient:
         params = {"token": token} if token else {}
         headers = self._get_headers()
 
+        # Modern 3X-UI indexes and deletes clients specifically by email.
+        # If email is not passed, find the email from 3X-UI inbound settings by matching client_uuid:
+        target_email = email.strip()
+        if not target_email and client_uuid:
+            try:
+                inbound = await self.get_inbound(inbound_id)
+                if inbound:
+                    settings = inbound.get("settings", {})
+                    if isinstance(settings, str):
+                        try:
+                            settings = json.loads(settings)
+                        except Exception:
+                            settings = {}
+                    clients = settings.get("clients", [])
+                    for cl in clients:
+                        if str(cl.get("id")).strip().lower() == client_uuid.strip().lower():
+                            target_email = str(cl.get("email", "")).strip()
+                            break
+            except Exception as e:
+                logger.warning(f"Failed to lookup client email for deletion: {e}")
+
         candidate_bases = [self._active_base_url] if self._active_base_url else self._get_candidate_urls()
         
-        # 1. Modern 3X-UI delete: POST /panel/api/clients/del/{uuid_or_email}
-        identifiers = [x for x in [email, client_uuid] if x]
+        # 1. Modern 3X-UI delete: POST /panel/api/clients/del/{email_or_uuid}
+        # In modern 3X-UI, email MUST come first!
+        identifiers = []
+        if target_email:
+            identifiers.append(target_email)
+        if email and email not in identifiers:
+            identifiers.append(email)
+        if client_uuid and client_uuid not in identifiers:
+            identifiers.append(client_uuid)
+
         for b in candidate_bases:
             b_clean = b.rstrip("/")
             for ident in identifiers:
@@ -592,9 +621,10 @@ class XUIClient:
                         if resp.status == 200:
                             data = await resp.json()
                             if data.get("success"):
+                                logger.info(f"Successfully deleted client {ident} from 3X-UI")
                                 return True, "Client deleted from 3X-UI"
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Error calling {url}: {e}")
 
         # 2. Legacy 3X-UI delete
         for b in candidate_bases:

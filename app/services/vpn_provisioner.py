@@ -237,8 +237,13 @@ class VPNProvisioner:
         if not srv:
             return False, "Service not found"
 
-        # Remove from 3X-UI
-        await xui_client.delete_client(inbound_id=srv.inbound_id, client_uuid=srv.client_uuid)
+        # Remove from 3X-UI (pass email, client_uuid, and inbound_id)
+        ok, msg = await xui_client.delete_client(
+            inbound_id=srv.inbound_id,
+            client_uuid=srv.client_uuid,
+            email=srv.client_email or ""
+        )
+        logger.info(f"3X-UI client deletion for service #{service_id} (email={srv.client_email}): ok={ok}, msg={msg}")
 
         await session.delete(srv)
         await session.commit()
