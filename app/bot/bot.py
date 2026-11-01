@@ -31,6 +31,7 @@ async def main():
             config.refresh_cache_sync()
             continue
 
+        bot = None
         try:
             logger.info("Starting Aiogram 3 Bot polling...")
             bot = Bot(
@@ -42,11 +43,18 @@ async def main():
 
             # Delete any existing webhook to ensure clean long polling
             await bot.delete_webhook(drop_pending_updates=True)
-            await dp.start_polling(bot)
+            logger.info("Aiogram 3 Polling started successfully. Listening for events...")
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
         except Exception as e:
             logger.error(f"Telegram Bot error: {e}. Retrying in 10 seconds...")
             await asyncio.sleep(10)
             config.refresh_cache_sync()
+        finally:
+            if bot is not None:
+                try:
+                    await bot.session.close()
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     try:

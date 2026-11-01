@@ -62,16 +62,24 @@ def parse_persian_number(val: str) -> Optional[int]:
 
 async def get_or_create_user(session: AsyncSession, msg: Message) -> User:
     """Ensure user is registered in SQLite with latest profile details"""
-    tg_id = msg.from_user.id
+    from_user = msg.from_user
+    tg_id = from_user.id if from_user else (msg.chat.id if msg.chat else 0)
+    if not tg_id:
+        tg_id = 0
+
     res = await session.execute(select(User).where(User.telegram_id == tg_id))
     user = res.scalar_one_or_none()
+
+    username = (from_user.username or "") if from_user else ""
+    first_name = (from_user.first_name or "") if from_user else ""
+    last_name = (from_user.last_name or "") if from_user else ""
 
     if not user:
         user = User(
             telegram_id=tg_id,
-            username=msg.from_user.username or "",
-            first_name=msg.from_user.first_name or "",
-            last_name=msg.from_user.last_name or "",
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
             wallet_balance=0,
             trial_used=0,
             is_blocked=0
@@ -79,18 +87,18 @@ async def get_or_create_user(session: AsyncSession, msg: Message) -> User:
         session.add(user)
         await session.commit()
         await session.refresh(user)
-        logger.info(f"Registered new user from Telegram: {tg_id} (@{msg.from_user.username})")
+        logger.info(f"Registered new user from Telegram: {tg_id} (@{username})")
     else:
         # Keep username, names fresh and heal null wallet_balance
         dirty = False
-        if msg.from_user.username and user.username != msg.from_user.username:
-            user.username = msg.from_user.username
+        if username and user.username != username:
+            user.username = username
             dirty = True
-        if msg.from_user.first_name and user.first_name != msg.from_user.first_name:
-            user.first_name = msg.from_user.first_name
+        if first_name and user.first_name != first_name:
+            user.first_name = first_name
             dirty = True
-        if msg.from_user.last_name and user.last_name != msg.from_user.last_name:
-            user.last_name = msg.from_user.last_name
+        if last_name and user.last_name != last_name:
+            user.last_name = last_name
             dirty = True
         if user.wallet_balance is None:
             user.wallet_balance = 0
@@ -787,3 +795,13 @@ async def cancel_handler(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("عملیات لغو شد.")
     await callback.answer()
+
+# --- 8. Fallback for any other text/message ---
+@router.message()
+async def handle_unknown_message(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "👋 پیام شما دریافت شد.\nلطفاً یکی از گزینه‌های زیر را از منوی ربات انتخاب فرمایید:",
+        reply_markup=main_menu_keyboard()
+    )
+
