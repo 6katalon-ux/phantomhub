@@ -202,17 +202,20 @@ async def callback_confirm_purchase(callback: CallbackQuery):
             await callback.message.edit_text(f"❌ خطا در فعال‌سازی سرویس:\n{msg}")
             return
 
-        expire_date = datetime.fromtimestamp(service.expire_time_ms / 1000).strftime("%Y-%m-%d")
-        total_gb = service.total_traffic_bytes / (1024**3)
+        expire_date = datetime.fromtimestamp(service.expire_time_ms / 1000).strftime("%Y-%m-%d") if service.expire_time_ms else "نامحدود"
+        total_gb = (service.total_traffic_bytes or 0) / (1024**3)
 
-        response_text = f"🎉 *اشتراک شما با موفقیت فعال شد!*\n\n"
-        response_text += f"🔑 شناسه سرویس: `{service.id}`\n"
-        response_text += f"📊 حجم کل: `{total_gb:.1f} گیگابایت`\n"
-        response_text += f"📅 تاریخ انقضا: `{expire_date}`\n\n"
-        response_text += f"📋 *کانفیگ اتصال شما:*\n`{service.config_link}`\n\n"
-        response_text += f"💡 _کانفیگ بالا را کپی کرده و در برنامه v2rayNG (اندروید) یا v2box / Streisand (آیفون) وارد فرمایید._"
+        response_text = f"🎉 <b>اشتراک شما با موفقیت فعال شد!</b>\n\n"
+        response_text += f"🔑 شناسه سرویس: <code>{service.id}</code>\n"
+        response_text += f"📊 حجم کل: <b>{total_gb:.1f} گیگابایت</b>\n"
+        response_text += f"📅 تاریخ انقضا: <code>{expire_date}</code>\n\n"
+        response_text += f"📋 <b>کانفیگ اتصال شما:</b>\n<code>{html.escape(service.config_link or '')}</code>\n\n"
+        response_text += f"💡 <i>کانفیگ بالا را کپی کرده و در برنامه v2rayNG (اندروید) یا v2box / Streisand (آیفون) وارد فرمایید.</i>"
 
-        await callback.message.edit_text(response_text, parse_mode="Markdown", reply_markup=service_actions_keyboard(service.id))
+        try:
+            await callback.message.edit_text(response_text, parse_mode="HTML", reply_markup=service_actions_keyboard(service.id))
+        except Exception:
+            await callback.message.edit_text(f"🎉 اشتراک شما فعال شد!\n\nکانفیگ:\n{service.config_link}", reply_markup=service_actions_keyboard(service.id))
         await callback.answer("خرید با موفقیت انجام شد ✅")
 
 # --- 2. Free Trial ---
@@ -236,15 +239,18 @@ async def handle_free_trial(message: Message, state: FSMContext):
             await message.answer(f"❌ خطا در ایجاد تست رایگان: {msg}")
             return
 
-        expire_date = datetime.fromtimestamp(service.expire_time_ms / 1000).strftime("%Y-%m-%d")
-        traffic_gb = config.get("trial_traffic_gb", 1)
+        expire_date = datetime.fromtimestamp(service.expire_time_ms / 1000).strftime("%Y-%m-%d") if service.expire_time_ms else "نامحدود"
+        trial_traffic = config.get("trial_traffic_gb", 1)
 
-        text = f"🎁 *اکانت تست رایگان شما آماده شد!*\n\n"
-        text += f"📊 حجم: *{traffic_gb} گیگابایت*\n"
-        text += f"📅 مهلت استفاده: `{expire_date}`\n\n"
-        text += f"📋 *کانفیگ تست:*\n`{service.config_link}`\n\n"
+        text = f"🎁 <b>اکانت تست رایگان شما آماده شد!</b>\n\n"
+        text += f"📊 حجم: <b>{trial_traffic} گیگابایت</b>\n"
+        text += f"📅 مهلت استفاده: <code>{expire_date}</code>\n\n"
+        text += f"📋 <b>کانفیگ تست:</b>\n<code>{html.escape(service.config_link or '')}</code>\n\n"
         text += "پس از تست، می‌توانید از بخش خرید اشتراک پلن اصلی خود را سفارش دهید."
-        await message.answer(text, parse_mode="Markdown", reply_markup=service_actions_keyboard(service.id))
+        try:
+            await message.answer(text, parse_mode="HTML", reply_markup=service_actions_keyboard(service.id))
+        except Exception:
+            await message.answer(f"🎁 اکانت تست رایگان شما:\n\nکانفیگ:\n{service.config_link}", reply_markup=service_actions_keyboard(service.id))
 
 # --- 3. My Account ---
 @router.message(
@@ -321,17 +327,20 @@ async def handle_my_services(message: Message, state: FSMContext):
         await message.answer(f"📡 *لیست اشتراک‌های شما ({len(services)} مورد):*", parse_mode="Markdown")
 
         for s in services[:5]: # Show up to 5 latest
-            used_gb = s.used_traffic_bytes / (1024**3)
-            total_gb = s.total_traffic_bytes / (1024**3)
-            expire_date = datetime.fromtimestamp(s.expire_time_ms / 1000).strftime("%Y-%m-%d")
+            used_gb = (s.used_traffic_bytes or 0) / (1024**3)
+            total_gb = (s.total_traffic_bytes or 0) / (1024**3)
+            expire_date = datetime.fromtimestamp(s.expire_time_ms / 1000).strftime("%Y-%m-%d") if s.expire_time_ms else "نامحدود"
             status_badge = "🟢 فعال" if s.is_active else "🔴 منقضی / غیرفعال"
 
-            card = f"📌 *سرویس شماره {s.id}* ({status_badge})\n"
-            card += f"📊 مصرف: *{used_gb:.2f} / {total_gb:.1f} گیگابایت*\n"
-            card += f"📅 تاریخ انقضا: `{expire_date}`\n"
-            card += f"📋 کانفیگ:\n`{s.config_link}`"
+            card = f"📌 <b>سرویس شماره {s.id}</b> ({status_badge})\n"
+            card += f"📊 مصرف: <b>{used_gb:.2f} / {total_gb:.1f} گیگابایت</b>\n"
+            card += f"📅 تاریخ انقضا: <code>{expire_date}</code>\n"
+            card += f"📋 <b>کانفیگ:</b>\n<code>{html.escape(s.config_link or '')}</code>"
 
-            await message.answer(card, parse_mode="Markdown", reply_markup=service_actions_keyboard(s.id))
+            try:
+                await message.answer(card, parse_mode="HTML", reply_markup=service_actions_keyboard(s.id))
+            except Exception:
+                await message.answer(f"📌 سرویس #{s.id} ({status_badge})\nکانفیگ:\n{s.config_link or ''}", reply_markup=service_actions_keyboard(s.id))
 
 # --- 5. Payment & Wallet Top-up ---
 @router.message(F.text.contains("کارت به کارت") | F.text.contains("افزایش موجودی") | F.text.contains("Payment") | F.text.contains("Wallet") | Command("wallet") | Command("pay"))
