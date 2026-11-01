@@ -6,13 +6,14 @@ wallet topups, payment receipt submission, and gift codes.
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime
 import math
+import html
 
 from app.models.models import User, Plan, Service, Payment, GiftCode, GiftRedemption
 from app.core.database import AsyncSessionLocal
@@ -79,11 +80,24 @@ async def get_or_create_user(session: AsyncSession, msg: Message) -> User:
         await session.refresh(user)
         logger.info(f"Registered new user from Telegram: {tg_id} (@{msg.from_user.username})")
     else:
-        # Keep username fresh
+        # Keep username, names fresh and heal null wallet_balance
+        dirty = False
         if msg.from_user.username and user.username != msg.from_user.username:
             user.username = msg.from_user.username
+            dirty = True
+        if msg.from_user.first_name and user.first_name != msg.from_user.first_name:
+            user.first_name = msg.from_user.first_name
+            dirty = True
+        if msg.from_user.last_name and user.last_name != msg.from_user.last_name:
+            user.last_name = msg.from_user.last_name
+            dirty = True
+        if user.wallet_balance is None:
+            user.wallet_balance = 0
+            dirty = True
+        if dirty:
             await session.commit()
     return user
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -105,8 +119,10 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(welcome_msg, reply_markup=main_menu_keyboard())
 
 # --- 1. Buy VPN ---
-@router.message(F.text.contains("خرید اشتراک") | F.text.contains("Buy VPN"))
-async def handle_buy_menu(message: Message):
+@router.message(F.text.contains("خرید اشتراک") | F.text.contains("Buy VPN"), StateFilter("*"))
+async def handle_buy_menu(message: Message, state: FSMContext = None):
+    if state:
+        await state.clear()
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         if user.is_blocked:
@@ -122,8 +138,9 @@ async def handle_buy_menu(message: Message):
             return
 
         currency = config.get("currency", "تومان")
+        wallet_bal = user.wallet_balance if user.wallet_balance is not None else 0
         text = f"🛍️ *لیست پلن‌های اشتراک VPN*\n\n"
-        text += f"💰 موجودی فعلی کیف پول شما: *{user.wallet_balance:,} {currency}*\n\n"
+        text += f"💰 موجودی فعلی کیف پول شما: *{wallet_bal:,} {currency}*\n\n"
         text += "لطفاً پلن مورد نظر خود را از دکمه‌های زیر انتخاب فرمایید:"
         await message.answer(text, parse_mode="Markdown", reply_markup=plans_keyboard(plans))
 
@@ -140,6 +157,7 @@ async def callback_select_plan(callback: CallbackQuery):
         res_user = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
         user = res_user.scalar_one_or_none()
         currency = config.get("currency", "تومان")
+        wallet_bal = user.wallet_balance if (user and user.wallet_balance is not None) else 0
 
         text = f"📦 *جزئیات پلن انتخابی:*\n\n"
         text += f"🔹 نام: *{plan.name}*\n"
@@ -147,10 +165,10 @@ async def callback_select_plan(callback: CallbackQuery):
         text += f"🔹 مدت اعتبار: *{plan.duration_days} روز*\n"
         text += f"🔹 قیمت: *{plan.price:,} {currency}*\n"
         text += f"🔹 حداکثر کاربر: *{plan.max_ips} کاربر همزمان*\n\n"
-        text += f"💰 موجودی کیف پول شما: *{user.wallet_balance:,} {currency}*\n"
+        text += f"💰 موجودی کیف پول شما: *{wallet_bal:,} {currency}*\n"
 
-        if user.wallet_balance < plan.price:
-            shortage = plan.price - user.wallet_balance
+        if wallet_bal < plan.price:
+            shortage = plan.price - wallet_bal
             text += f"\n❌ *موجودی شما کافی نیست.* برای خرید این پلن نیاز به شارژ *{shortage:,} {currency}* دیگر دارید.\nاز منوی اصلی روی «افزایش موجودی» بزنید."
             await callback.message.edit_text(text, parse_mode="Markdown")
             await callback.answer()
@@ -197,8 +215,10 @@ async def callback_confirm_purchase(callback: CallbackQuery):
         await callback.answer("خرید با موفقیت انجام شد ✅")
 
 # --- 2. Free Trial ---
-@router.message(F.text.contains("تست رایگان") | F.text.contains("Free Trial"))
-async def handle_free_trial(message: Message):
+@router.message(F.text.contains("تست رایگان") | F.text.contains("Free Trial"), StateFilter("*"))
+async def handle_free_trial(message: Message, state: FSMContext = None):
+    if state:
+        await state.clear()
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         if user.trial_used:
@@ -227,8 +247,20 @@ async def handle_free_trial(message: Message):
         await message.answer(text, parse_mode="Markdown", reply_markup=service_actions_keyboard(service.id))
 
 # --- 3. My Account ---
-@router.message(F.text.contains("حساب کاربری") | F.text.contains("My Account"))
-async def handle_my_account(message: Message):
+@router.message(
+    F.text.contains("حساب کاربری") |
+    F.text.contains("حساب من") |
+    F.text.contains("حساب") |
+    F.text.contains("پروفایل") |
+    F.text.contains("My Account") |
+    F.text.contains("Account") |
+    Command("account") |
+    Command("profile"),
+    StateFilter("*")
+)
+async def handle_my_account(message: Message, state: FSMContext = None):
+    if state:
+        await state.clear()
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         res = await session.execute(select(Service).where(Service.user_id == user.id))
@@ -237,21 +269,46 @@ async def handle_my_account(message: Message):
 
         reg_date = user.created_at.strftime("%Y-%m-%d") if user.created_at else "نامشخص"
         active_count = sum(1 for s in services if s.is_active)
+        wallet_bal = user.wallet_balance if user.wallet_balance is not None else 0
+        trial_status = "دریافت شده" if user.trial_used else "قابل دریافت"
 
-        text = f"👤 *مشخصات حساب کاربری شما:*\n\n"
-        text += f"🆔 شناسه کاربری عددی: `{user.telegram_id}`\n"
-        text += f"👤 نام: *{user.first_name or ''} {user.last_name or ''}*\n"
-        text += f"🏷️ نام کاربری: @{user.username or 'ندارد'}\n"
-        text += f"💰 موجودی کیف پول: *{user.wallet_balance:,} {currency}*\n"
-        text += f"📡 تعداد سرویس‌های فعال: *{active_count} عدد*\n"
-        text += f"🎁 وضعیت تست رایگان: *{'دریافت شده' if user.trial_used else 'قابل دریافت'}*\n"
-        text += f"📅 تاریخ عضویت: `{reg_date}`\n"
+        safe_first = html.escape(user.first_name or "")
+        safe_last = html.escape(user.last_name or "")
+        full_name = f"{safe_first} {safe_last}".strip() or "کاربر گرامی"
+        username_str = f"@{html.escape(user.username)}" if user.username else "ندارد"
 
-        await message.answer(text, parse_mode="Markdown")
+        text = (
+            f"👤 <b>مشخصات حساب کاربری شما:</b>\n\n"
+            f"🆔 شناسه کاربری عددی: <code>{user.telegram_id}</code>\n"
+            f"👤 نام: <b>{full_name}</b>\n"
+            f"🏷️ نام کاربری: <b>{username_str}</b>\n"
+            f"💰 موجودی کیف پول: <b>{wallet_bal:,} {currency}</b>\n"
+            f"📡 تعداد سرویس‌های فعال: <b>{active_count} عدد</b>\n"
+            f"🎁 وضعیت تست رایگان: <b>{trial_status}</b>\n"
+            f"📅 تاریخ عضویت: <code>{reg_date}</code>\n"
+        )
+
+        try:
+            await message.answer(text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"HTML send failed for my_account ({e}), falling back to plain text")
+            plain_text = (
+                f"👤 مشخصات حساب کاربری شما:\n\n"
+                f"🆔 شناسه کاربری عددی: {user.telegram_id}\n"
+                f"👤 نام: {user.first_name or ''} {user.last_name or ''}\n"
+                f"🏷️ نام کاربری: @{user.username or 'ندارد'}\n"
+                f"💰 موجودی کیف پول: {wallet_bal:,} {currency}\n"
+                f"📡 تعداد سرویس‌های فعال: {active_count} عدد\n"
+                f"🎁 وضعیت تست رایگان: {trial_status}\n"
+                f"📅 تاریخ عضویت: {reg_date}\n"
+            )
+            await message.answer(plain_text)
 
 # --- 4. My Services ---
-@router.message(F.text.contains("سرویس‌های من") | F.text.contains("My Services"))
-async def handle_my_services(message: Message):
+@router.message(F.text.contains("سرویس‌های من") | F.text.contains("My Services"), StateFilter("*"))
+async def handle_my_services(message: Message, state: FSMContext = None):
+    if state:
+        await state.clear()
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         res = await session.execute(
@@ -279,7 +336,7 @@ async def handle_my_services(message: Message):
             await message.answer(card, parse_mode="Markdown", reply_markup=service_actions_keyboard(s.id))
 
 # --- 5. Payment & Wallet Top-up ---
-@router.message(F.text.contains("کارت به کارت") | F.text.contains("افزایش موجودی") | F.text.contains("Payment") | F.text.contains("Wallet"))
+@router.message(F.text.contains("کارت به کارت") | F.text.contains("افزایش موجودی") | F.text.contains("Payment") | F.text.contains("Wallet"), StateFilter("*"))
 async def handle_payment_menu(message: Message, state: FSMContext):
     await state.clear()
     card_number = config.get("card_number", "6037-9975-0000-0000")
@@ -290,7 +347,7 @@ async def handle_payment_menu(message: Message, state: FSMContext):
 
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
-        user_balance = user.wallet_balance
+        user_balance = user.wallet_balance if user.wallet_balance is not None else 0
 
     text = f"💰 *مدیریت کیف پول و افزایش موجودی*\n\n"
     text += f"👤 کاربر: *{message.from_user.first_name or ''}*\n"
@@ -586,8 +643,9 @@ async def handle_admin_payment_action(callback: CallbackQuery):
 
 
 # --- 6. Gift Code ---
-@router.message(F.text.contains("کد هدیه") | F.text.contains("Gift Code"))
+@router.message(F.text.contains("کد هدیه") | F.text.contains("Gift Code"), StateFilter("*"))
 async def handle_gift_code_prompt(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer("🎟️ لطفاً کد هدیه دریافتی خود را ارسال فرمایید:", reply_markup=cancel_keyboard())
     await state.set_state(FormStates.waiting_for_gift_code)
 
@@ -652,8 +710,10 @@ async def process_gift_code(message: Message, state: FSMContext):
     await state.clear()
 
 # --- 7. Support ---
-@router.message(F.text.contains("پشتیبانی") | F.text.contains("Support"))
-async def handle_support(message: Message):
+@router.message(F.text.contains("پشتیبانی") | F.text.contains("Support"), StateFilter("*"))
+async def handle_support(message: Message, state: FSMContext = None):
+    if state:
+        await state.clear()
     sup_username = config.get("bot_support_username", "@support_vpn")
     text = f"💬 *پشتیبانی فنی و فروش*\n\n"
     text += f"جهت پاسخگویی به هرگونه سوال، راهنمایی نصب یا گزارش قطعی، با آیدی پشتیبانی در ارتباط باشید:\n\n"
