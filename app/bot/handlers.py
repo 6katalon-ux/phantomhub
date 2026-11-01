@@ -6,9 +6,10 @@ wallet topups, payment receipt submission, and gift codes.
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
-from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime
@@ -119,10 +120,10 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(welcome_msg, reply_markup=main_menu_keyboard())
 
 # --- 1. Buy VPN ---
-@router.message(F.text.contains("خرید اشتراک") | F.text.contains("Buy VPN"), StateFilter("*"))
-async def handle_buy_menu(message: Message, state: FSMContext = None):
-    if state:
-        await state.clear()
+@router.message(F.text.contains("خرید اشتراک") | F.text.contains("Buy VPN") | Command("buy"))
+async def handle_buy_menu(message: Message, state: FSMContext):
+    await state.clear()
+
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         if user.is_blocked:
@@ -215,10 +216,9 @@ async def callback_confirm_purchase(callback: CallbackQuery):
         await callback.answer("خرید با موفقیت انجام شد ✅")
 
 # --- 2. Free Trial ---
-@router.message(F.text.contains("تست رایگان") | F.text.contains("Free Trial"), StateFilter("*"))
-async def handle_free_trial(message: Message, state: FSMContext = None):
-    if state:
-        await state.clear()
+@router.message(F.text.contains("تست رایگان") | F.text.contains("Free Trial") | Command("trial"))
+async def handle_free_trial(message: Message, state: FSMContext):
+    await state.clear()
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         if user.trial_used:
@@ -255,12 +255,10 @@ async def handle_free_trial(message: Message, state: FSMContext = None):
     F.text.contains("My Account") |
     F.text.contains("Account") |
     Command("account") |
-    Command("profile"),
-    StateFilter("*")
+    Command("profile")
 )
-async def handle_my_account(message: Message, state: FSMContext = None):
-    if state:
-        await state.clear()
+async def handle_my_account(message: Message, state: FSMContext):
+    await state.clear()
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         res = await session.execute(select(Service).where(Service.user_id == user.id))
@@ -305,10 +303,10 @@ async def handle_my_account(message: Message, state: FSMContext = None):
             await message.answer(plain_text)
 
 # --- 4. My Services ---
-@router.message(F.text.contains("سرویس‌های من") | F.text.contains("My Services"), StateFilter("*"))
-async def handle_my_services(message: Message, state: FSMContext = None):
-    if state:
-        await state.clear()
+@router.message(F.text.contains("سرویس‌های من") | F.text.contains("My Services") | Command("services"))
+async def handle_my_services(message: Message, state: FSMContext):
+    await state.clear()
+
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         res = await session.execute(
@@ -336,9 +334,10 @@ async def handle_my_services(message: Message, state: FSMContext = None):
             await message.answer(card, parse_mode="Markdown", reply_markup=service_actions_keyboard(s.id))
 
 # --- 5. Payment & Wallet Top-up ---
-@router.message(F.text.contains("کارت به کارت") | F.text.contains("افزایش موجودی") | F.text.contains("Payment") | F.text.contains("Wallet"), StateFilter("*"))
+@router.message(F.text.contains("کارت به کارت") | F.text.contains("افزایش موجودی") | F.text.contains("Payment") | F.text.contains("Wallet") | Command("wallet") | Command("pay"))
 async def handle_payment_menu(message: Message, state: FSMContext):
     await state.clear()
+
     card_number = config.get("card_number", "6037-9975-0000-0000")
     card_holder = config.get("card_holder", "صاحب حساب")
     crypto_wallet = config.get("crypto_wallet", "")
@@ -405,8 +404,53 @@ async def handle_topup_amount_selection(callback: CallbackQuery, state: FSMConte
         await callback.message.answer(text, parse_mode="Markdown", reply_markup=cancel_keyboard())
     await callback.answer()
 
+def is_navigation_or_cancel(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(k in t for k in [
+        "/start", "/cancel", "لغو", "انصراف",
+        "خرید اشتراک", "buy", "تست رایگان", "trial",
+        "حساب", "account", "سرویس", "service",
+        "موجودی", "کارت", "wallet", "payment",
+        "کد هدیه", "gift", "پشتیبانی", "support"
+    ])
+
+async def handle_navigation_fallback(message: Message, state: FSMContext):
+    await state.clear()
+    t = (message.text or "").lower()
+    if any(c in t for c in ["/cancel", "لغو", "انصراف"]):
+        await message.answer("عملیات لغو شد.", reply_markup=main_menu_keyboard())
+        return
+    if "حساب" in t or "account" in t or "پروفایل" in t:
+        await handle_my_account(message, state)
+        return
+    if "سرویس" in t or "service" in t:
+        await handle_my_services(message, state)
+        return
+    if "خرید" in t or "buy" in t:
+        await handle_buy_menu(message, state)
+        return
+    if "تست" in t or "trial" in t:
+        await handle_free_trial(message, state)
+        return
+    if "پشتیبانی" in t or "support" in t:
+        await handle_support(message, state)
+        return
+    if "موجودی" in t or "کارت" in t or "wallet" in t or "payment" in t:
+        await handle_payment_menu(message, state)
+        return
+    if "کد هدیه" in t or "gift" in t:
+        await handle_gift_code_prompt(message, state)
+        return
+    await message.answer("به منوی اصلی بازگشتید.", reply_markup=main_menu_keyboard())
+
 @router.message(FormStates.waiting_for_custom_amount)
 async def process_custom_amount(message: Message, state: FSMContext):
+    if message.text and is_navigation_or_cancel(message.text):
+        await handle_navigation_fallback(message, state)
+        return
+
     currency = config.get("currency", "تومان")
     amount = parse_persian_number(message.text or "")
     if not amount or amount < 10000:
@@ -437,9 +481,14 @@ async def process_custom_amount(message: Message, state: FSMContext):
 
 @router.message(FormStates.waiting_for_payment_receipt)
 async def process_payment_receipt(message: Message, state: FSMContext):
+    if message.text and not message.photo and is_navigation_or_cancel(message.text):
+        await handle_navigation_fallback(message, state)
+        return
+
     data = await state.get_data()
     amount = data.get("topup_amount")
     currency = config.get("currency", "تومان")
+
 
     # If amount was missing from state, try extracting from text/caption
     if not amount:
@@ -643,7 +692,7 @@ async def handle_admin_payment_action(callback: CallbackQuery):
 
 
 # --- 6. Gift Code ---
-@router.message(F.text.contains("کد هدیه") | F.text.contains("Gift Code"), StateFilter("*"))
+@router.message(F.text.contains("کد هدیه") | F.text.contains("Gift Code") | Command("gift"))
 async def handle_gift_code_prompt(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("🎟️ لطفاً کد هدیه دریافتی خود را ارسال فرمایید:", reply_markup=cancel_keyboard())
@@ -651,7 +700,12 @@ async def handle_gift_code_prompt(message: Message, state: FSMContext):
 
 @router.message(FormStates.waiting_for_gift_code)
 async def process_gift_code(message: Message, state: FSMContext):
+    if message.text and is_navigation_or_cancel(message.text):
+        await handle_navigation_fallback(message, state)
+        return
+
     code_str = (message.text or "").strip().upper()
+
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message)
         res = await session.execute(select(GiftCode).where(GiftCode.code == code_str, GiftCode.is_active == 1))
@@ -710,10 +764,9 @@ async def process_gift_code(message: Message, state: FSMContext):
     await state.clear()
 
 # --- 7. Support ---
-@router.message(F.text.contains("پشتیبانی") | F.text.contains("Support"), StateFilter("*"))
-async def handle_support(message: Message, state: FSMContext = None):
-    if state:
-        await state.clear()
+@router.message(F.text.contains("پشتیبانی") | F.text.contains("Support") | Command("support"))
+async def handle_support(message: Message, state: FSMContext):
+    await state.clear()
     sup_username = config.get("bot_support_username", "@support_vpn")
     text = f"💬 *پشتیبانی فنی و فروش*\n\n"
     text += f"جهت پاسخگویی به هرگونه سوال، راهنمایی نصب یا گزارش قطعی، با آیدی پشتیبانی در ارتباط باشید:\n\n"
