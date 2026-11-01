@@ -21,7 +21,7 @@ SYNC_DATABASE_URL = f"sqlite:///{DB_PATH}"
 async_engine = create_async_engine(
     ASYNC_DATABASE_URL,
     echo=False,
-    connect_args={"check_same_thread": False}
+    connect_args={"check_same_thread": False, "timeout": 30}
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -34,7 +34,7 @@ AsyncSessionLocal = async_sessionmaker(
 sync_engine = create_engine(
     SYNC_DATABASE_URL,
     echo=False,
-    connect_args={"check_same_thread": False}
+    connect_args={"check_same_thread": False, "timeout": 30}
 )
 
 @event.listens_for(sync_engine, "connect")
@@ -42,6 +42,16 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")
     cursor.execute("PRAGMA foreign_keys=ON;")
+    cursor.execute("PRAGMA busy_timeout=30000;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+    cursor.close()
+
+@event.listens_for(async_engine.sync_engine, "connect")
+def set_sqlite_async_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA foreign_keys=ON;")
+    cursor.execute("PRAGMA busy_timeout=30000;")
     cursor.execute("PRAGMA synchronous=NORMAL;")
     cursor.close()
 

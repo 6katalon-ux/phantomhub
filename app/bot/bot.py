@@ -5,12 +5,18 @@ and handles auto-reconnects and polling.
 """
 
 import asyncio
+import logging
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from app.core.config import config
 from app.core.logging import logger
 from app.bot.handlers import router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s'
+)
 
 async def main():
     logger.info("Initializing VPN Store Telegram Bot worker...")
@@ -33,18 +39,40 @@ async def main():
 
         bot = None
         try:
-            logger.info("Starting Aiogram 3 Bot polling...")
+            logger.info("Creating Aiogram 3 Bot client...")
             bot = Bot(
                 token=token,
                 default=DefaultBotProperties(parse_mode=ParseMode.HTML)
             )
+            me = await bot.get_me()
+            logger.info(f"✅ Bot connected to Telegram as @{me.username} (ID: {me.id}, Name: {me.first_name})")
+
             dp = Dispatcher()
+
+            # Global middleware to trace every single event and log any unhandled error
+            @dp.update.outer_middleware()
+            async def update_tracer_middleware(handler, event, data):
+                event_type = getattr(event, "event_type", "unknown")
+                user = getattr(getattr(event, "event", None), "from_user", None)
+                user_desc = f"@{user.username} ({user.id})" if user else "anonymous"
+                logger.info(f"📥 Received Telegram event: {event_type} from {user_desc}")
+                try:
+                    return await handler(event, data)
+                except Exception as ex:
+                    logger.exception(f"❌ Error in Telegram handler: {ex}")
+                    raise ex
+
             dp.include_router(router)
 
-            # Delete any existing webhook to ensure clean long polling
+            # Clear any stale webhooks
             await bot.delete_webhook(drop_pending_updates=True)
-            logger.info("Aiogram 3 Polling started successfully. Listening for events...")
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            logger.info("🚀 Aiogram 3 Polling started! Listening for messages & buttons...")
+
+            # Explicitly listen for message and callback_query
+            await dp.start_polling(
+                bot,
+                allowed_updates=["message", "callback_query"]
+            )
         except Exception as e:
             logger.error(f"Telegram Bot error: {e}. Retrying in 10 seconds...")
             await asyncio.sleep(10)
